@@ -1,0 +1,28 @@
+# ====================================================================
+# CETAK BIRU PERAKITAN OTOMATIS EMO.AI - FORMAT FINAL VALIDASI SAH
+# ====================================================================
+workflows:
+  android-release:
+    name: Emo AI Android Release Build
+    instance_type: mac_mini_m1 # VM gratisan macOS
+    max_build_duration: 30
+    environment:
+      flutter: stable
+    triggering:
+      events:
+        - push
+      # Format resmi Codemagic untuk mengunci target cabang utama (main)
+      branch_patterns:
+        - pattern: 'main'
+    scripts:
+      - name: 1. Lahirkan Folder Android Bersih (Solusi Utama)
+        script: |
+          flutter create . --platforms=android
+      - name: 2. Unduh Pustaka Dependencies
+        script: |
+          flutter pub get
+      - name: 3. Merakit File APK Tradisional
+        script: |
+          flutter build apk --release --debug
+    artifacts:
+      - build/app/outputs/flutter-apk/*.apk

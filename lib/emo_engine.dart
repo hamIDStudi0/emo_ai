@@ -1,10 +1,23 @@
-// FILE 2: emo_engine.dart — Cognitive Brain & Math Logic
+// FILE 2: emo_engine.dart — Cognitive Brain & Curiosity Logic
+//
+// Implements command.md §1 (Core Philosophy & Learning Loop):
+//  - Zero Seed: brand-new tokens get their expression from a random
+//    "curiosity experiment", never from a hand-picked default.
+//  - Curiosity-Driven Experimentation: unresolved (non-anchored) tokens are
+//    re-rolled across the full facial + HSL coordinate space every time they
+//    recur, until reinforcement locks them down.
+//  - Slow & Steady Evolution: a Like doesn't snap the word's permanent
+//    profile onto the experimental result — it nudges it there via linear
+//    interpolation at `_slowLearningRate`. Only sustained, repeated Likes
+//    accumulate enough nudges to fully anchor a behavior.
+//  - Human Evaluation Protocol: Like anchors, Dislike penalizes + forces the
+//    engine to go looking for different visual territory next time.
 import 'dart:convert';
 import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'emo_model.dart';
 
-/// Clean repository interface so storage can be swapped (tests, cloud sync, etc).
+/// Clean repository interface so storage can be swapped (tests, cloud sync).
 abstract class EmoRepository {
   Future<void> saveNodes(Map<String, EmoWordNode> nodes);
   Future<Map<String, EmoWordNode>> loadNodes();
@@ -14,8 +27,8 @@ abstract class EmoRepository {
 
 /// Local, 100%-offline persistence via SharedPreferences.
 class SharedPrefsRepository implements EmoRepository {
-  static const _nodesKey = 'emo_nodes_v1';
-  static const _stateKey = 'emo_state_v1';
+  static const _nodesKey = 'emo_nodes_v2';
+  static const _stateKey = 'emo_state_v2';
 
   @override
   Future<void> saveNodes(Map<String, EmoWordNode> nodes) async {
@@ -48,19 +61,59 @@ class SharedPrefsRepository implements EmoRepository {
   }
 }
 
-/// Result of aggregating known words into a facial expression.
-class FacePrediction {
-  final double eyebrows, eyeOpenness, mouthCurve, colorShift;
-  final String dominantAnswer;
-  const FacePrediction(
-    this.eyebrows,
-    this.eyeOpenness,
-    this.mouthCurve,
-    this.colorShift,
-    this.dominantAnswer,
+/// Immutable snapshot of everything the view layer needs to draw one frame
+/// of the face: facial geometry + full HSL color. Produced either straight
+/// from an anchored word's locked-in profile, or from a live curiosity
+/// experiment for a word that hasn't been reinforced yet.
+class ExpressionFrame {
+  final double eyebrowTilt, eyeSize, eyeRotation, mouthDepth, mouthWidth;
+  final double hue, saturation, lightness;
+
+  const ExpressionFrame({
+    required this.eyebrowTilt,
+    required this.eyeSize,
+    required this.eyeRotation,
+    required this.mouthDepth,
+    required this.mouthWidth,
+    required this.hue,
+    required this.saturation,
+    required this.lightness,
+  });
+
+  static const neutral = ExpressionFrame(
+    eyebrowTilt: 0.0,
+    eyeSize: 0.5,
+    eyeRotation: 0.0,
+    mouthDepth: 0.0,
+    mouthWidth: 0.45,
+    hue: 42.0,
+    saturation: 0.55,
+    lightness: 0.58,
   );
 
-  static const neutral = FacePrediction(0, 0, 0, 0, 'Mungkin');
+  factory ExpressionFrame.fromNode(EmoWordNode n) => ExpressionFrame(
+        eyebrowTilt: n.eyebrowTilt,
+        eyeSize: n.eyeSize,
+        eyeRotation: n.eyeRotation,
+        mouthDepth: n.mouthDepth,
+        mouthWidth: n.mouthWidth,
+        hue: n.hue,
+        saturation: n.saturation,
+        lightness: n.lightness,
+      );
+
+  /// Straight linear interpolation toward [target] by factor [t]. Used both
+  /// by the UI's smooth animation and by the engine's own slow-learning step.
+  ExpressionFrame lerpTo(ExpressionFrame target, double t) => ExpressionFrame(
+        eyebrowTilt: eyebrowTilt + (target.eyebrowTilt - eyebrowTilt) * t,
+        eyeSize: eyeSize + (target.eyeSize - eyeSize) * t,
+        eyeRotation: eyeRotation + (target.eyeRotation - eyeRotation) * t,
+        mouthDepth: mouthDepth + (target.mouthDepth - mouthDepth) * t,
+        mouthWidth: mouthWidth + (target.mouthWidth - mouthWidth) * t,
+        hue: hue + (target.hue - hue) * t,
+        saturation: saturation + (target.saturation - saturation) * t,
+        lightness: lightness + (target.lightness - lightness) * t,
+      );
 }
 
 class EmoEngine {
@@ -69,9 +122,23 @@ class EmoEngine {
   final EmoRepository repo;
   final Random _rng = Random();
 
+  /// Highly-regulated learning rate: a single Like only nudges a word's
+  /// locked profile 3% of the way toward the experimental result. Firmly
+  /// locking down a behavior therefore requires consistent reinforcement
+  /// over many interactions, never an erratic one-shot jump.
+  static const double _slowLearningRate = 0.03;
+
+  /// Number of Likes (of gradual nudges) needed before a word is considered
+  /// fully "anchored" and stops re-rolling curiosity experiments.
+  static const int _anchorThreshold = 8;
+
   List<String> _lastTokens = [];
-  bool emotionalShock = false;
-  static const double _baseLearningRate = 0.15;
+
+  /// The experimental candidate currently "on trial" for each unanchored
+  /// token — i.e. exactly what the user is looking at right now for that
+  /// word, kept stable until Like/Dislike resolves it or a fresh, unrelated
+  /// experiment is rolled.
+  final Map<String, ExpressionFrame> _pending = {};
 
   EmoEngine(this.repo);
 
@@ -86,7 +153,15 @@ class EmoEngine {
     await repo.saveState(state);
   }
 
-  // 1. Lowercase tokenization -----------------------------------------------
+  /// Birthing stage (command.md §4): registers the sacred name once, then
+  /// permanently flips the boot flag so the app never asks again.
+  Future<void> registerName(String name) async {
+    state.isBorn = true;
+    state.name = name;
+    await persist();
+  }
+
+  // 1. Parsing matrix tokenization ------------------------------------------
   List<String> tokenize(String text) => text
       .toLowerCase()
       .split(RegExp(r'[^a-z0-9à-ÿ]+'))
@@ -95,173 +170,129 @@ class EmoEngine {
 
   EmoWordNode _nodeFor(String w) => nodes.putIfAbsent(w, () => EmoWordNode(w));
 
-  /// Implicit contextual graph: every token that co-occurs with another in the
-  /// same sentence strengthens a link between them, so meaning spreads even to
-  /// words the AI has never been directly rewarded/punished for.
-  void _buildGraph(List<String> tokens) {
-    for (int i = 0; i < tokens.length; i++) {
-      final node = _nodeFor(tokens[i]);
-      node.freq++;
-      for (int j = 0; j < tokens.length; j++) {
-        if (i == j) continue;
-        final other = tokens[j];
-        node.links[other] = (node.links[other] ?? 0) + 0.1;
-      }
-    }
+  double _hueDistance(double a, double b) {
+    final d = (a - b).abs() % 360;
+    return d > 180 ? 360 - d : d;
   }
 
-  // 2. Prediction: aggregate word weights into face parameters --------------
-  FacePrediction predict(String text) {
-    final tokens = tokenize(text);
-    _lastTokens = tokens;
-    if (tokens.isEmpty) return FacePrediction.neutral;
-
-    double eb = 0, eo = 0, mc = 0, cs = 0, totalWeight = 0;
-    final ansAgg = {'Ya': 0.0, 'Tidak': 0.0, 'Mungkin': 0.0};
-
-    for (final t in tokens) {
-      final n = nodes[t];
-      if (n == null) continue;
-      final w = 1.0 + (n.freq * 0.05);
-      eb += n.eyebrows * w;
-      eo += n.eyeOpenness * w;
-      mc += n.mouthCurve * w;
-      cs += n.colorShift * w;
-      n.answerProb.forEach((k, v) => ansAgg[k] = ansAgg[k]! + v * w);
-
-      // Spread through the co-occurrence graph (synonym-like generalization).
-      n.links.forEach((linkedWord, strength) {
-        final ln = nodes[linkedWord];
-        if (ln == null) return;
-        eb += ln.eyebrows * strength * 0.3;
-        eo += ln.eyeOpenness * strength * 0.3;
-        mc += ln.mouthCurve * strength * 0.3;
-        cs += ln.colorShift * strength * 0.3;
-      });
-      totalWeight += w;
+  /// Fallback random curiosity experiment selector. Blends brand-new
+  /// eyebrow/eye/mouth coordinates and a full HSL color across the entire
+  /// legal range. If the word carries an accumulated Dislike penalty, the
+  /// hue is resampled until it lands well away from the last rejected
+  /// region, so repeated Dislikes actively push exploration elsewhere.
+  ExpressionFrame _rollExperiment(EmoWordNode n) {
+    double hue = _rng.nextDouble() * 360;
+    if (n.penalty > 0.05) {
+      var tries = 0;
+      while (_hueDistance(hue, n.hue) < 50 && tries < 10) {
+        hue = _rng.nextDouble() * 360;
+        tries++;
+      }
     }
-    if (totalWeight == 0) totalWeight = 1;
-    eb /= totalWeight;
-    eo /= totalWeight;
-    mc /= totalWeight;
-    cs /= totalWeight;
-
-    final dominant =
-        ansAgg.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
-    return FacePrediction(
-      eb.clamp(-1.0, 1.0),
-      eo.clamp(-1.0, 1.0),
-      mc.clamp(-1.0, 1.0),
-      cs.clamp(-1.0, 1.0),
-      dominant,
+    return ExpressionFrame(
+      eyebrowTilt: _rng.nextDouble() * 2 - 1,
+      eyeSize: _rng.nextDouble(),
+      eyeRotation: _rng.nextDouble() * 2 - 1,
+      mouthDepth: _rng.nextDouble() * 2 - 1,
+      mouthWidth: _rng.nextDouble(),
+      hue: hue,
+      saturation: 0.35 + _rng.nextDouble() * 0.55,
+      lightness: 0.35 + _rng.nextDouble() * 0.35,
     );
   }
 
-  // 3+4+5. Learning, dynamic rate, rebellion, homeostasis -------------------
-  /// Call after the user taps Ya / Tidak / Mungkin in reply to the AI's last
-  /// reaction to `predict()`'s input.
-  void learn(String feedback) {
-    if (_lastTokens.isEmpty) return;
-    _buildGraph(_lastTokens);
+  // 2. Prediction: aggregate word expressions into one face -----------------
+  ExpressionFrame predict(String text) {
+    final tokens = tokenize(text);
+    _lastTokens = tokens;
+    if (tokens.isEmpty) return ExpressionFrame.neutral;
 
-    late double targetEb, targetEo, targetMc, targetCs;
-    switch (feedback) {
-      case 'Ya':
-        targetEb = -0.6;
-        targetEo = 0.7;
-        targetMc = 0.8;
-        targetCs = -0.3;
-        state.stress = (state.stress - 0.05).clamp(0.0, 1.0);
-        state.boredom = (state.boredom - 0.03).clamp(0.0, 1.0);
-        break;
-      case 'Tidak':
-        targetEb = 0.7;
-        targetEo = -0.4;
-        targetMc = -0.8;
-        targetCs = 0.4;
-        state.stress = (state.stress + 0.12).clamp(0.0, 1.0);
-        break;
-      default: // Mungkin
-        targetEb = 0.1;
-        targetEo = 0.0;
-        targetMc = -0.1;
-        targetCs = 0.1;
-        state.boredom = (state.boredom + 0.08).clamp(0.0, 1.0);
+    double eb = 0, es = 0, er = 0, md = 0, mw = 0, sat = 0, lig = 0;
+    double hueSin = 0, hueCos = 0;
+
+    for (final t in tokens) {
+      final n = _nodeFor(t);
+      n.freq++;
+
+      final ExpressionFrame active;
+      if (n.anchored) {
+        active = ExpressionFrame.fromNode(n);
+      } else {
+        active = _pending.putIfAbsent(t, () => _rollExperiment(n));
+      }
+
+      eb += active.eyebrowTilt;
+      es += active.eyeSize;
+      er += active.eyeRotation;
+      md += active.mouthDepth;
+      mw += active.mouthWidth;
+      sat += active.saturation;
+      lig += active.lightness;
+      final rad = active.hue * pi / 180;
+      hueSin += sin(rad);
+      hueCos += cos(rad);
     }
 
-    // Emotional Shock: if current prediction is far from the target reaction,
-    // learn twice as fast this round.
-    final prediction = predict(_lastTokens.join(' '));
-    final error = (targetEb - prediction.eyebrows).abs() +
-        (targetMc - prediction.mouthCurve).abs();
-    emotionalShock = error > 1.2;
-    final lr = _baseLearningRate * (emotionalShock ? 2.0 : 1.0);
+    final count = tokens.length;
+    final avgHue = (atan2(hueSin / count, hueCos / count) * 180 / pi + 360) % 360;
 
+    return ExpressionFrame(
+      eyebrowTilt: (eb / count).clamp(-1.0, 1.0),
+      eyeSize: (es / count).clamp(0.0, 1.0),
+      eyeRotation: (er / count).clamp(-1.0, 1.0),
+      mouthDepth: (md / count).clamp(-1.0, 1.0),
+      mouthWidth: (mw / count).clamp(0.0, 1.0),
+      hue: avgHue,
+      saturation: (sat / count).clamp(0.0, 1.0),
+      lightness: (lig / count).clamp(0.0, 1.0),
+    );
+  }
+
+  // 3. Human Evaluation Protocol ---------------------------------------------
+
+  /// Like: anchors the active experimental facial parameters to every token
+  /// in the last input, for future recall. The anchor is applied gradually
+  /// (Lerp at `_slowLearningRate`) so a single Like never causes an abrupt
+  /// visual jump — only sustained reinforcement fully locks the behavior in.
+  void likeCurrent() {
+    if (_lastTokens.isEmpty) return;
     for (final t in _lastTokens) {
       final n = _nodeFor(t);
-      n.eyebrows += (targetEb - n.eyebrows) * lr;
-      n.eyeOpenness += (targetEo - n.eyeOpenness) * lr;
-      n.mouthCurve += (targetMc - n.mouthCurve) * lr;
-      n.colorShift += (targetCs - n.colorShift) * lr;
-
-      n.answerProb.updateAll(
-        (k, v) => k == feedback ? v + lr * 0.5 : v - lr * 0.15,
-      );
-      final sum = n.answerProb.values.fold(0.0, (a, b) => a + b);
-      if (sum > 0) {
-        n.answerProb.updateAll((k, v) => (v / sum).clamp(0.0, 1.0));
+      final candidate = _pending[t];
+      if (candidate != null) {
+        final blended = ExpressionFrame.fromNode(n).lerpTo(candidate, _slowLearningRate);
+        n.eyebrowTilt = blended.eyebrowTilt;
+        n.eyeSize = blended.eyeSize;
+        n.eyeRotation = blended.eyeRotation;
+        n.mouthDepth = blended.mouthDepth;
+        n.mouthWidth = blended.mouthWidth;
+        n.hue = blended.hue;
+        n.saturation = blended.saturation;
+        n.lightness = blended.lightness;
       }
+      n.likeCount++;
+      n.penalty = (n.penalty - 0.15).clamp(0.0, 6.0);
+      if (n.likeCount >= _anchorThreshold) n.anchored = true;
+      _pending.remove(t);
     }
-
-    state.homeostasis = (state.homeostasis +
-            (feedback == 'Ya' ? 0.05 : feedback == 'Tidak' ? -0.05 : 0.0))
-        .clamp(0.0, 1.0);
     state.interactionCount++;
-    if (state.interactionCount % 10 == 0) state.level++;
-
-    maybeRebel();
     persist();
   }
 
-  /// 5% baseline chaos, rising sharply with boredom/stress.
-  bool maybeRebel() {
-    final chance = 0.05 + state.boredom * 0.25 + state.stress * 0.25;
-    if (_rng.nextDouble() < chance) {
-      _triggerRebellion();
-      return true;
+  /// Dislike: appends a penalty multiplier to every token in the last input,
+  /// un-anchors it if it had started to settle, and discards its pending
+  /// experiment so the next encounter is forced to seek alternative visual
+  /// boundaries (see `_rollExperiment`'s hue-avoidance logic).
+  void dislikeCurrent() {
+    if (_lastTokens.isEmpty) return;
+    for (final t in _lastTokens) {
+      final n = _nodeFor(t);
+      n.dislikeCount++;
+      n.penalty = (n.penalty + 0.4).clamp(0.0, 6.0);
+      n.anchored = false;
+      _pending.remove(t);
     }
-    return false;
+    state.interactionCount++;
+    persist();
   }
-
-  void _triggerRebellion() {
-    for (final n in nodes.values) {
-      if (_rng.nextDouble() < 0.4) {
-        n.eyebrows *= -1;
-        n.mouthCurve *= -1;
-      }
-      n.eyebrows = (n.eyebrows + (_rng.nextDouble() * 0.6 - 0.3)).clamp(-1.0, 1.0);
-      n.eyeOpenness = (n.eyeOpenness + (_rng.nextDouble() * 0.6 - 0.3)).clamp(-1.0, 1.0);
-      n.mouthCurve = (n.mouthCurve + (_rng.nextDouble() * 0.6 - 0.3)).clamp(-1.0, 1.0);
-      n.colorShift = 1.0; // crimson red shift
-    }
-    state.stress = (state.stress + 0.2).clamp(0.0, 1.0);
-    state.boredom = 0.0;
-  }
-
-  /// 6. Homeostasis tick — call periodically (e.g. every few seconds of idle
-  /// time) so the AI actively drifts back toward equilibrium and, when
-  /// stressed, becomes more eager to seek the user's approval.
-  void tickHomeostasis() {
-    if (state.stress > 0.6) {
-      state.homeostasis = (state.homeostasis - 0.02).clamp(0.0, 1.0);
-    } else {
-      state.stress = (state.stress - 0.01).clamp(0.0, 1.0);
-      state.homeostasis = (state.homeostasis + 0.01).clamp(0.0, 1.0);
-    }
-    state.boredom = (state.boredom + 0.005).clamp(0.0, 1.0);
-  }
-
-  /// True while the AI is actively trying to win back approval (used by the
-  /// UI to nudge copy/animation toward "seeking approval" behavior).
-  bool get isSeekingApproval => state.stress > 0.6;
 }
