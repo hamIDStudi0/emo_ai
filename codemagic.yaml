@@ -6,15 +6,13 @@ workflows:
     name: Emo AI Android Release Build
     instance_type: mac_mini_m1
     max_build_duration: 30
-    
+
     environment:
       flutter: stable
-      # Mengimpor grup variabel yang kita buat di dashboard tadi
       groups:
-        - keystore_credentials 
+        - keystore_credentials
       vars:
         PACKAGE_NAME: "com.example.emo_ai"
-        # Menentukan jalur folder sementara untuk menyimpan file .p12 hasil decode
         CM_KEYSTORE_PATH: "/tmp/keystore.p12"
 
     triggering:
@@ -30,7 +28,6 @@ workflows:
 
       - name: 2. Rekonstruksi File .p12 dari Teks Base64
         script: |
-          # Mengubah kembali teks Base64 rahasia menjadi file fisik di dalam mesin
           echo "$CM_KEYSTORE_BASE64" | base64 --decode > $CM_KEYSTORE_PATH
 
       - name: 3. Suntik Konfigurasi Keystore ke key.properties
@@ -40,13 +37,48 @@ workflows:
           echo "keyAlias=$CM_KEY_ALIAS" >> android/key.properties
           echo "storeFile=$CM_KEYSTORE_PATH" >> android/key.properties
 
-      - name: 4. Unduh Pustaka Dependencies
+      - name: 4. Patch build.gradle agar Membaca key.properties
+        script: |
+          cat >> android/app/build.gradle << 'EOF'
+
+          def keystoreProperties = new Properties()
+          def keystorePropertiesFile = rootProject.file('key.properties')
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+          }
+
+          android {
+              signingConfigs {
+                  release {
+                      keyAlias keystoreProperties['keyAlias']
+                      keyPassword keystoreProperties['keyPassword']
+                      storeFile file(keystoreProperties['storeFile'])
+                      storePassword keystoreProperties['storePassword']
+                      storeType 'PKCS12'
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      minifyEnabled true
+                      shrinkResources true
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                  }
+              }
+          }
+          EOF
+
+      - name: 5. Unduh Pustaka Dependencies
         script: |
           flutter pub get
 
-      - name: 5. Merakit File APK Rilis
+      - name: 6. Merakit File APK Rilis
         script: |
           flutter build apk --release
+
+      - name: 7. Verifikasi Signing (opsional, cek di log build)
+        script: |
+          jarsigner -verify -verbose -certs build/app/outputs/flutter-apk/app-release.apk || true
 
     artifacts:
       - build/app/outputs/flutter-apk/*.apk
