@@ -9,11 +9,13 @@ workflows:
     
     environment:
       flutter: stable
-      # Cukup panggil nama referensi yang Anda buat saat upload tadi
-      android_signing:
-        - my_keystore   
+      # Mengimpor grup variabel yang kita buat di dashboard tadi
+      groups:
+        - keystore_credentials 
       vars:
         PACKAGE_NAME: "com.example.emo_ai"
+        # Menentukan jalur folder sementara untuk menyimpan file .p12 hasil decode
+        CM_KEYSTORE_PATH: "/tmp/keystore.p12"
 
     triggering:
       events:
@@ -26,19 +28,23 @@ workflows:
         script: |
           flutter create . --platforms=android
 
-      - name: 2. Suntik Konfigurasi Keystore (Otomatis Membaca File .p12)
+      - name: 2. Rekonstruksi File .p12 dari Teks Base64
         script: |
-          # Codemagic otomatis merubah file .p12 Anda menjadi variabel $CM_KEYSTORE_PATH
+          # Mengubah kembali teks Base64 rahasia menjadi file fisik di dalam mesin
+          echo "$CM_KEYSTORE_BASE64" | base64 --decode > $CM_KEYSTORE_PATH
+
+      - name: 3. Suntik Konfigurasi Keystore ke key.properties
+        script: |
           echo "storePassword=$CM_KEYSTORE_PASSWORD" > android/key.properties
           echo "keyPassword=$CM_KEY_PASSWORD" >> android/key.properties
           echo "keyAlias=$CM_KEY_ALIAS" >> android/key.properties
           echo "storeFile=$CM_KEYSTORE_PATH" >> android/key.properties
 
-      - name: 3. Unduh Pustaka Dependencies
+      - name: 4. Unduh Pustaka Dependencies
         script: |
           flutter pub get
 
-      - name: 4. Merakit File APK Rilis
+      - name: 5. Merakit File APK Rilis
         script: |
           flutter build apk --release
 
