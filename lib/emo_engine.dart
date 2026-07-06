@@ -39,6 +39,18 @@ abstract class EmoRepository {
   Future<void> saveMemory(Map<String, EmoMemoryEntry> memory);
   Future<EmoState?> loadState();
   Future<void> saveState(EmoState state);
+
+  /// Mencatat SATU baris ulasan (Like/Dislike) apa adanya — tanpa nama,
+  /// tanpa identitas pengguna. Ini terpisah dari `saveMemory` (yang cuma
+  /// simpan skor teragregasi): tabel ini adalah log historis mentah supaya
+  /// tren belajar bisa dianalisis nanti (kapan disukai, kapan tidak, untuk
+  /// kata/emoji apa).
+  Future<void> logReview({
+    required bool liked,
+    required List<String> keys,
+    required List<String> emojis,
+    required bool isIdle,
+  });
 }
 
 /// Cloud persistence via Turso's documented SQL-over-HTTP pipeline
@@ -107,6 +119,17 @@ class TursoRepository implements EmoRepository {
             'name TEXT NOT NULL DEFAULT \'\', '
             'interaction_count INTEGER NOT NULL DEFAULT 0)',
       },
+      // Log ulasan mentah — TIDAK ADA kolom nama/identitas pengguna sama
+      // sekali, sesuai permintaan: hanya jejak anonim dari respon + ulasan.
+      {
+        'sql': 'CREATE TABLE IF NOT EXISTS emo_reviews ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+            'ts INTEGER NOT NULL, '
+            'liked INTEGER NOT NULL, '
+            'is_idle INTEGER NOT NULL, '
+            'keys_json TEXT NOT NULL, '
+            'emojis_json TEXT NOT NULL)',
+      },
     ]);
   }
 
@@ -165,6 +188,28 @@ class TursoRepository implements EmoRepository {
       },
     ]);
   }
+
+  @override
+  Future<void> logReview({
+    required bool liked,
+    required List<String> keys,
+    required List<String> emojis,
+    required bool isIdle,
+  }) async {
+    await _pipeline([
+      {
+        'sql': 'INSERT INTO emo_reviews (ts, liked, is_idle, keys_json, emojis_json) '
+            'VALUES (?, ?, ?, ?, ?)',
+        'args': [
+          _intArg(DateTime.now().millisecondsSinceEpoch),
+          _intArg(liked ? 1 : 0),
+          _intArg(isIdle ? 1 : 0),
+          _textArg(jsonEncode(keys)),
+          _textArg(jsonEncode(emojis)),
+        ],
+      },
+    ]);
+  }
 }
 
 /// Safety net so the app still runs (without persistence) if Turso isn't
@@ -191,6 +236,24 @@ class InMemoryRepository implements EmoRepository {
 
   @override
   Future<void> saveState(EmoState state) async => _state = state;
+
+  final List<Map<String, dynamic>> _reviewLog = [];
+
+  @override
+  Future<void> logReview({
+    required bool liked,
+    required List<String> keys,
+    required List<String> emojis,
+    required bool isIdle,
+  }) async {
+    _reviewLog.add({
+      'ts': DateTime.now().millisecondsSinceEpoch,
+      'liked': liked,
+      'isIdle': isIdle,
+      'keys': keys,
+      'emojis': emojis,
+    });
+  }
 }
 
 /// One emitted turn: the emoji glyphs shown, the memory keys that produced
@@ -232,6 +295,15 @@ class EmoEngine {
     await repo.saveState(state);
   }
 
+  /// Menandai entitas sebagai "lahir" secara otomatis, TANPA meminta nama
+  /// apa pun. `registerName` di bawah masih tersedia kalau suatu saat mau
+  /// dipakai lagi secara opsional, tapi jalur utama tidak memanggilnya lagi.
+  Future<void> autoBornIfNeeded() async {
+    if (state.isBorn) return;
+    state.isBorn = true;
+    await persist();
+  }
+
   Future<void> registerName(String name) async {
     state.isBorn = true;
     state.name = name;
@@ -244,28 +316,82 @@ class EmoEngine {
       .where((t) => t.isNotEmpty)
       .toList();
 
-  /// Unigrams + consecutive bigrams — the "Tabel Ingatan" is keyed on both,
-  /// so the engine can react to a single word as well as short phrases.
-  List<String> _buildKeys(List<String> tokens) {
-    final keys = <String>[];
+  /// Kata hubung/fungsi Indonesia yang paling umum — bobotnya sengaja
+  /// direndahkan supaya "kata isi" (kata yang benar-benar membawa makna/
+  /// perasaan, misalnya "bahagia", "sedih", "capek") yang lebih sering jadi
+  /// kunci pemilihan emoji, bukan "yang", "dan", "di", dst. Ini bukan kamus
+  /// makna (engine tetap zero-knowledge soal EMOJI apa yang cocok), hanya
+  /// heuristik tata-bahasa ringan untuk tahu kata mana yang "penting".
+  static const Set<String> _fungsi = {
+    'yang', 'dan', 'di', 'ke', 'dari', 'itu', 'ini', 'ada', 'akan', 'juga',
+    'saya', 'aku', 'kamu', 'kita', 'kami', 'dengan', 'untuk', 'pada', 'atau',
+    'tidak', 'saja', 'sudah', 'belum', 'masih', 'lagi', 'kok', 'sih', 'deh',
+    'nya', 'apa', 'ya', 'aja', 'gitu', 'gak', 'ga', 'the', 'a', 'an', 'is',
+    'am', 'are', 'to', 'of', 'in', 'on',
+  };
+
+  /// Memecah kalimat jadi unigram + bigram + trigram, lalu memberi BOBOT
+  /// tiap kunci: kata isi > kata fungsi, dan frasa (bigram/trigram) > kata
+  /// tunggal karena membawa lebih banyak konteks. Kunci dengan bobot lebih
+  /// besar lebih sering dipilih untuk menghasilkan emoji — jadi kalimat
+  /// pendek pun bisa "dirangkai" maknanya dengan cepat tanpa perlu kamus
+  /// makna dari nol.
+  List<MapEntry<String, int>> _buildWeightedKeys(List<String> tokens) {
+    final entries = <MapEntry<String, int>>[];
     for (var i = 0; i < tokens.length; i++) {
-      keys.add(tokens[i]);
-      if (i + 1 < tokens.length) keys.add('${tokens[i]}|${tokens[i + 1]}');
+      final isFungsi = _fungsi.contains(tokens[i]);
+      entries.add(MapEntry(tokens[i], isFungsi ? 1 : 3));
+      if (i + 1 < tokens.length) {
+        entries.add(MapEntry('${tokens[i]}|${tokens[i + 1]}', 4));
+      }
+      if (i + 2 < tokens.length) {
+        entries.add(MapEntry('${tokens[i]}|${tokens[i + 1]}|${tokens[i + 2]}', 6));
+      }
     }
-    return keys;
+    return entries;
+  }
+
+  String _weightedPickKey(List<MapEntry<String, int>> weighted) {
+    final total = weighted.fold<int>(0, (sum, e) => sum + e.value);
+    var roll = _rng.nextInt(total);
+    for (final e in weighted) {
+      if (roll < e.value) return e.key;
+      roll -= e.value;
+    }
+    return weighted.last.key;
   }
 
   /// Epsilon-greedy pick for a single key: Eksplorasi Acak vs Eksploitasi
   /// Memori. Epsilon starts at 1.0 (fully random — zero knowledge) and
   /// shrinks toward a small floor as the key accumulates exposure.
+  ///
+  /// PERBAIKAN BUG: sebelumnya, kalau satu-satunya emoji yang pernah dicoba
+  /// untuk sebuah kata itu skornya sudah NEGATIF (pernah di-dislike), fungsi
+  /// `reduce()` tetap memilih dia lagi karena tidak ada pembanding lain di
+  /// map — jadi ia "nempel" di emoji yang jelas-jelas ditolak. Sekarang:
+  /// kalau skor terbaik yang diketahui untuk kata itu sudah di bawah 0,
+  /// engine dipaksa Eksplorasi Acak (bukan tetap Eksploitasi skor negatif),
+  /// dan emoji yang baru saja di-dislike untuk kata itu dihindari supaya
+  /// tidak langsung terpilih ulang secara kebetulan.
   String _pickEmoji(String key) {
     final entry = _memory.putIfAbsent(key, () => EmoMemoryEntry(key));
     final epsilon = (1.0 - entry.freq * 0.05).clamp(0.08, 1.0);
+
+    MapEntry<String, double>? best;
+    if (entry.scores.isNotEmpty) {
+      best = entry.scores.entries.reduce((a, b) => a.value >= b.value ? a : b);
+    }
+    final bestIsDisliked = best != null && best.value < 0;
+    final shouldExplore = best == null || bestIsDisliked || _rng.nextDouble() < epsilon;
+
     String emoji;
-    if (entry.scores.isEmpty || _rng.nextDouble() < epsilon) {
-      emoji = kEmojiPalette[_rng.nextInt(kEmojiPalette.length)];
+    if (shouldExplore) {
+      final avoid = bestIsDisliked ? best!.key : null;
+      do {
+        emoji = kEmojiPalette[_rng.nextInt(kEmojiPalette.length)];
+      } while (emoji == avoid && kEmojiPalette.length > 1);
     } else {
-      emoji = entry.scores.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+      emoji = best!.key;
     }
     entry.freq++;
     return emoji;
@@ -276,14 +402,14 @@ class EmoEngine {
   /// Like/Dislike, or until it's overwritten by the next chain.
   EmoChain reply(String text) {
     final tokens = tokenize(text);
-    final keys = _buildKeys(tokens);
-    if (keys.isEmpty) keys.add('_neutral_');
+    var weighted = _buildWeightedKeys(tokens);
+    if (weighted.isEmpty) weighted = [const MapEntry('_neutral_', 1)];
 
     final length = 1 + _rng.nextInt(3);
     final emojis = <String>[];
     final usedKeys = <String>[];
     for (var i = 0; i < length; i++) {
-      final key = keys[_rng.nextInt(keys.length)];
+      final key = _weightedPickKey(weighted);
       emojis.add(_pickEmoji(key));
       usedKeys.add(key);
     }
@@ -329,5 +455,8 @@ class EmoEngine {
     }
     _pending = null;
     persist();
+    // Log baris ulasan mentah — anonim, tanpa nama/identitas — sebagai
+    // riwayat terpisah dari skor teragregasi, agar bisa dianalisis nanti.
+    repo.logReview(liked: liked, keys: chain.keys, emojis: chain.emojis, isIdle: chain.isIdle);
   }
 }

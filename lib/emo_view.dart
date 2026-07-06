@@ -101,72 +101,11 @@ class EmojiStage extends StatelessWidget {
   }
 }
 
-/// §4-equivalent Birthing Stage, updated for the emoji engine.
-class EmoBirthScreen extends StatefulWidget {
-  final EmoEngine engine;
-  final VoidCallback onBorn;
-  const EmoBirthScreen({super.key, required this.engine, required this.onBorn});
-
-  @override
-  State<EmoBirthScreen> createState() => _EmoBirthScreenState();
-}
-
-class _EmoBirthScreenState extends State<EmoBirthScreen> {
-  final TextEditingController _nameCtrl = TextEditingController();
-
-  @override
-  void dispose() {
-    _nameCtrl.dispose();
-    super.dispose();
-  }
-
-  Future<void> _birth() async {
-    final name = _nameCtrl.text.trim();
-    if (name.isEmpty) return;
-    await widget.engine.registerName(name);
-    widget.onBorn();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF0D0F14),
-      body: SafeArea(
-        child: Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.symmetric(horizontal: 32),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Text('👋', style: TextStyle(fontSize: 72)),
-                const SizedBox(height: 32),
-                const Text(
-                  'Beri nama untuk entitas ini',
-                  style: TextStyle(color: Colors.white70, fontSize: 16),
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: _nameCtrl,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white, fontSize: 20),
-                  decoration: const InputDecoration(
-                    hintText: 'Nama...',
-                    hintStyle: TextStyle(color: Colors.white38),
-                    enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
-                    focusedBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.amber)),
-                  ),
-                  onSubmitted: (_) => _birth(),
-                ),
-                const SizedBox(height: 24),
-                ElevatedButton(onPressed: _birth, child: const Text('Lahirkan')),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
+// Catatan: layar "beri nama" sebelumnya DIHAPUS atas permintaan — proses
+// kelahiran kini otomatis lewat `EmoEngine.autoBornIfNeeded()` di
+// emo_engine.dart, tanpa meminta nama apa pun. Ini sejalan dengan permintaan
+// agar data yang tersimpan di Turso (termasuk log ulasan) benar-benar
+// anonim, tidak terikat pada identitas siapa pun.
 
 class EmoHomeScreen extends StatefulWidget {
   final EmoEngine engine;
@@ -373,6 +312,141 @@ class _EmoHomeScreenState extends State<EmoHomeScreen> {
   }
 }
 
+/// Layar boot bergaya "Android TV": logo yang berdenyut (pulse), beberapa
+/// cincin yang mengembang dan memudar berurutan (ripple), garis progres
+/// yang mengisi dari kiri, serta titik-titik loading yang menyala bergilir.
+/// Semuanya CSS-free (murni Flutter `AnimationController`), tidak butuh
+/// aset gambar apa pun — konsisten dengan semangat "zero-asset" proyek ini.
+class _BootScreen extends StatefulWidget {
+  const _BootScreen();
+
+  @override
+  State<_BootScreen> createState() => _BootScreenState();
+}
+
+class _BootScreenState extends State<_BootScreen> with TickerProviderStateMixin {
+  late final AnimationController _pulseCtrl;
+  late final AnimationController _rippleCtrl;
+  late final AnimationController _dotsCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1400))
+      ..repeat(reverse: true);
+    _rippleCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 2200))
+      ..repeat();
+    _dotsCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))
+      ..repeat();
+  }
+
+  @override
+  void dispose() {
+    _pulseCtrl.dispose();
+    _rippleCtrl.dispose();
+    _dotsCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0D0F14),
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 180,
+              height: 180,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  // Tiga cincin ripple, masing-masing dengan offset fase
+                  // berbeda supaya terlihat "mengembang berurutan" seperti
+                  // logo boot Android TV.
+                  for (final phase in [0.0, 0.33, 0.66])
+                    AnimatedBuilder(
+                      animation: _rippleCtrl,
+                      builder: (context, _) {
+                        final t = (_rippleCtrl.value + phase) % 1.0;
+                        return Opacity(
+                          opacity: (1.0 - t) * 0.6,
+                          child: Container(
+                            width: 70 + t * 110,
+                            height: 70 + t * 110,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(color: Colors.amber, width: 2),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  // Logo/emoji inti yang berdenyut pelan.
+                  AnimatedBuilder(
+                    animation: _pulseCtrl,
+                    builder: (context, child) {
+                      final scale = 0.92 + _pulseCtrl.value * 0.16;
+                      return Transform.scale(scale: scale, child: child);
+                    },
+                    child: const Text('🤖', style: TextStyle(fontSize: 64)),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 36),
+            // Garis progres tak-tentu (indeterminate) bergaya TV.
+            SizedBox(
+              width: 160,
+              height: 4,
+              child: AnimatedBuilder(
+                animation: _rippleCtrl,
+                builder: (context, _) {
+                  return ClipRRect(
+                    borderRadius: BorderRadius.circular(2),
+                    child: LinearProgressIndicator(
+                      value: null,
+                      backgroundColor: Colors.white10,
+                      valueColor: const AlwaysStoppedAnimation(Colors.amber),
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 20),
+            // Titik-titik loading yang menyala bergiliran.
+            AnimatedBuilder(
+              animation: _dotsCtrl,
+              builder: (context, _) {
+                final active = (_dotsCtrl.value * 3).floor() % 3;
+                return Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: List.generate(3, (i) {
+                    final isActive = i == active;
+                    return AnimatedContainer(
+                      duration: const Duration(milliseconds: 200),
+                      margin: const EdgeInsets.symmetric(horizontal: 4),
+                      width: isActive ? 10 : 7,
+                      height: isActive ? 10 : 7,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: isActive ? Colors.amber : Colors.white24,
+                      ),
+                    );
+                  }),
+                );
+              },
+            ),
+            const SizedBox(height: 16),
+            const Text('Menyalakan...', style: TextStyle(color: Colors.white38, fontSize: 13)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class EmoRoot extends StatefulWidget {
   const EmoRoot({super.key});
 
@@ -391,7 +465,10 @@ class _EmoRootState extends State<EmoRoot> {
         ? TursoRepository(databaseUrl: TursoConfig.databaseUrl, authToken: TursoConfig.authToken)
         : InMemoryRepository();
     _engine = EmoEngine(repo);
-    _engine.init().then((_) {
+    _engine.init().then((_) async {
+      // Kelahiran otomatis, tanpa meminta nama — lihat catatan di
+      // EmoBirthScreen (dihapus) dan EmoEngine.autoBornIfNeeded().
+      await _engine.autoBornIfNeeded();
       if (mounted) setState(() => _ready = true);
     });
   }
@@ -399,13 +476,7 @@ class _EmoRootState extends State<EmoRoot> {
   @override
   Widget build(BuildContext context) {
     if (!_ready) {
-      return const Scaffold(
-        backgroundColor: Color(0xFF0D0F14),
-        body: Center(child: CircularProgressIndicator(color: Colors.amber)),
-      );
-    }
-    if (!_engine.state.isBorn) {
-      return EmoBirthScreen(engine: _engine, onBorn: () => setState(() {}));
+      return const _BootScreen();
     }
     return EmoHomeScreen(engine: _engine);
   }
