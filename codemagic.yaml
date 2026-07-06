@@ -4,13 +4,14 @@
 workflows:
   android-release:
     name: Emo AI Android Release Build
-    instance_type: mac_mini_m1 # Menggunakan VM macOS
+    instance_type: mac_mini_m1
     max_build_duration: 30
     
     environment:
       flutter: stable
+      # Cukup panggil nama referensi yang Anda buat saat upload tadi
       android_signing:
-        - my_keystore   # WAJIB: Sesuai dengan nama referensi di dashboard Codemagic Anda
+        - my_keystore   
       vars:
         PACKAGE_NAME: "com.example.emo_ai"
 
@@ -18,16 +19,16 @@ workflows:
       events:
         - push
       branch_patterns:
-        - pattern: 'main' # Otomatis rilis saat ada push ke branch main
+        - pattern: 'main'
 
     scripts:
       - name: 1. Lahirkan Folder Android Bersih
         script: |
           flutter create . --platforms=android
 
-      - name: 2. Suntik Konfigurasi Keystore (Aman & Otomatis)
+      - name: 2. Suntik Konfigurasi Keystore (Otomatis Membaca File .p12)
         script: |
-          # Membuat file key.properties yang otomatis dibaca oleh build.gradle bawaan Flutter
+          # Codemagic otomatis merubah file .p12 Anda menjadi variabel $CM_KEYSTORE_PATH
           echo "storePassword=$CM_KEYSTORE_PASSWORD" > android/key.properties
           echo "keyPassword=$CM_KEY_PASSWORD" >> android/key.properties
           echo "keyAlias=$CM_KEY_ALIAS" >> android/key.properties
