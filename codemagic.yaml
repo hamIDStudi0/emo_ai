@@ -1,5 +1,5 @@
 # ====================================================================
-# CETAK BIRU PERAKITAN OTOMATIS EMO.AI - FORMAT REVISI AMAN GRADLE
+# CETAK BIRU PERAKITAN OTOMATIS EMO.AI - METODE FRESH RE-CLONE 
 # ====================================================================
 workflows:
   android-release:
@@ -22,10 +22,25 @@ workflows:
         - pattern: 'main'
 
     scripts:
-      - name: 1. Lahirkan Folder Android Bersih
+      - name: 1. Rekonstruksi Struktur Project Baru & Bersih
         script: |
-          rm -rf android
-          flutter create . --platforms=android --overwrite
+          # 1. Amankan file kode inti Anda ke folder sementara
+          mkdir -p /tmp/core_app
+          cp -r lib /tmp/core_app/
+          cp pubspec.yaml /tmp/core_app/
+          [ -d "assets" ] && cp -r assets /tmp/core_app/ || echo "No assets folder"
+
+          # 2. Hapus seluruh isi folder kerja saat ini tanpa sisa
+          rm -rf * .??*
+
+          # 3. Buat proyek Flutter baru dari nol (Pondasi Gradle paling modern)
+          flutter create . --project-name=emo_ai --org=com.example --platforms=android
+
+          # 4. Kembalikan file kode inti Anda ke proyek baru
+          rm -rf lib pubspec.yaml assets
+          cp -r /tmp/core_app/lib .
+          cp /tmp/core_app/pubspec.yaml .
+          [ -d "/tmp/core_app/assets" ] && cp -r /tmp/core_app/assets . || echo "No assets to restore"
 
       - name: 2. Rekonstruksi File .p12 dari Teks Base64
         script: |
@@ -39,13 +54,9 @@ workflows:
           echo "storeFile=$CM_KEYSTORE_PATH" >> android/key.properties
           echo "storeType=PKCS12" >> android/key.properties
 
-      - name: 4. Suntik Pengaturan Rilis ke build.gradle Bawaan
+      - name: 4. Suntik Pengaturan Rilis ke build.gradle Baru
         script: |
-          # Memastikan file build.gradle bawaan Flutter ada sebelum dimodifikasi
-          ls -la android/app/build.gradle
-          
-          # Menggunakan printf untuk menyisipkan konfigurasi pembacaan key.properties 
-          # langsung ke file asli tanpa menimpa pengaturan SDK/Plugins bawaan.
+          # Menyisipkan konfigurasi tanda tangan rilis ke build.gradle baru yang suci dari error
           printf '\n\n
           def keystoreProperties = new Properties()
           def keystorePropertiesFile = rootProject.file("key.properties")
@@ -59,7 +70,7 @@ workflows:
                       keyAlias keystoreProperties["keyAlias"]
                       keyPassword keystoreProperties["keyPassword"]
                       storeFile file(keystoreProperties["storeFile"])
-                      storePassword keystoreProperties['\''storePassword'\'']
+                      storePassword keystoreProperties["storePassword"]
                       storeType "PKCS12"
                   }
               }
@@ -80,8 +91,6 @@ workflows:
 
       - name: 6. Merakit File APK Rilis dengan Proteksi
         script: |
-          # Menggunakan --no-shrink jika terjadi error kompilasi resource, 
-          # tapi kita coba standar rilis aman dulu dengan obfuscate
           flutter build apk --release \
             --obfuscate \
             --split-debug-info=build/app/outputs/symbols
