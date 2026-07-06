@@ -58,17 +58,28 @@ workflows:
         script: |
           # Flutter versi baru membuat android/app/build.gradle.kts (Kotlin DSL),
           # bukan lagi build.gradle (Groovy) — deteksi dulu file mana yang
-          # sebenarnya ada, baru suntik sintaks yang cocok. Ini yang
-          # menyebabkan error "unsupported Gradle project" sebelumnya:
-          # sintaks Groovy disuntik ke file yang salah/tidak ada.
+          # sebenarnya ada, baru suntik sintaks yang cocok.
+          #
+          # Tambahan: AGP 9.x defaultnya pakai "newDsl" yang mengubah tipe
+          # extension android{} (BaseAppModuleExtension -> ApplicationExtension)
+          # dan bikin konfigurasi signingConfigs/buildTypes gaya lama gagal.
+          # android.newDsl=false mengembalikan perilaku lama yang masih resmi
+          # didukung sampai AGP 10, jadi script di bawah tetap kompatibel.
+          echo "android.newDsl=false" >> android/gradle.properties
+
           if [ -f android/app/build.gradle.kts ]; then
             echo "Terdeteksi Kotlin DSL (build.gradle.kts)"
+            # Import HARUS ada di baris paling atas file Kotlin (bukan
+            # fully-qualified di tengah body) — makanya di-prepend, bukan
+            # di-append di bawah bersama konfigurasi android{}.
+            printf 'import java.util.Properties\nimport java.io.FileInputStream\n\n' \
+              | cat - android/app/build.gradle.kts > /tmp/bgk.tmp && mv /tmp/bgk.tmp android/app/build.gradle.kts
             cat >> android/app/build.gradle.kts << 'EOF'
 
-          val keystoreProperties = java.util.Properties()
+          val keystoreProperties = Properties()
           val keystorePropertiesFile = rootProject.file("key.properties")
           if (keystorePropertiesFile.exists()) {
-              keystoreProperties.load(java.io.FileInputStream(keystorePropertiesFile))
+              keystoreProperties.load(FileInputStream(keystorePropertiesFile))
           }
 
           android {
@@ -76,7 +87,7 @@ workflows:
                   getByName("release") {
                       keyAlias = keystoreProperties.getProperty("keyAlias")
                       keyPassword = keystoreProperties.getProperty("keyPassword")
-                      storeFile = keystoreProperties.getProperty("storeFile")?.let { file(it) }
+                      storeFile = file(keystoreProperties.getProperty("storeFile")!!)
                       storePassword = keystoreProperties.getProperty("storePassword")
                       storeType = "PKCS12"
                   }
