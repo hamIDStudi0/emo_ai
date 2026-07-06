@@ -37,23 +37,73 @@ workflows:
           echo "keyPassword=$CM_KEY_PASSWORD" >> android/key.properties
           echo "keyAlias=$CM_KEY_ALIAS" >> android/key.properties
           echo "storeFile=$CM_KEYSTORE_PATH" >> android/key.properties
-          # Memaksa Gradle mengenali format sertifikat .p12 Anda
           echo "storeType=PKCS12" >> android/key.properties
 
-      - name: 4. Optimasi build.gradle secara Aman (ProGuard & Minify)
+      - name: 4. Tulis Ulang build.gradle Rilis (Lolos Play Protect)
         script: |
-          # Mengaktifkan pengecilan ukuran APK dan pengaburan kode ProGuard langsung di baris rilis bawaan Flutter
-          sed -i '' 's/signingConfig signingConfigs.debug/signingConfig signingConfigs.release/g' android/app/build.gradle
+          # Menghapus file build.gradle bawaan yang sering hilang/konflik
+          rm -f android/app/build.gradle
           
-          # Menyisipkan aturan optimasi biner agar aplikasi lebih ringan dan sulit didekompilasi
-          # Ini memodifikasi blok buildTypes.release bawaan Flutter tanpa merusak strukturnya
-          sed -i '' '/buildTypes {/a\
-          \        release {\
-          \            minifyEnabled true\
-          \            shrinkResources true\
-          \            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"\
-          \        }
-          ' android/app/build.gradle
+          # Membuat file build.gradle rilis baru yang super aman dari nol
+          cat > android/app/build.gradle << 'EOF'
+          plugins {
+              id "com.android.application"
+              id "kotlin-android"
+              id "dev.flutter.flutter-gradle-plugin"
+          }
+
+          def keystoreProperties = new Properties()
+          def keystorePropertiesFile = rootProject.file('key.properties')
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+          }
+
+          android {
+              namespace "com.example.emo_ai"
+              compileSdk flutter.compileSdkVersion
+              ndkVersion flutter.ndkVersion
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+
+              kotlinOptions {
+                  jvmTarget = '1.8'
+              }
+
+              defaultConfig {
+                  applicationId "com.example.emo_ai"
+                  minSdk flutter.minSdkVersion
+                  targetSdk flutter.targetSdkVersion
+                  versionCode flutter.versionCode
+                  versionName flutter.versionName
+              }
+
+              signingConfigs {
+                  release {
+                      keyAlias keystoreProperties['keyAlias']
+                      keyPassword keystoreProperties['keyPassword']
+                      storeFile file(keystoreProperties['storeFile'])
+                      storePassword keystoreProperties['storePassword']
+                      storeType 'PKCS12'
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      minifyEnabled true
+                      shrinkResources true
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                  }
+              }
+          }
+
+          flutter {
+              source '../..'
+          }
+          EOF
 
       - name: 5. Unduh Pustaka Dependencies
         script: |
@@ -61,7 +111,6 @@ workflows:
 
       - name: 6. Merakit File APK Rilis dengan Proteksi
         script: |
-          # Ditambah fitur pengaburan kode bawaan Flutter untuk mengamankan string kode Anda
           flutter build apk --release \
             --obfuscate \
             --split-debug-info=build/app/outputs/symbols
