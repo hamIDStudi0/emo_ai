@@ -1,298 +1,333 @@
-// FILE 2: emo_engine.dart — Cognitive Brain & Curiosity Logic
+// FILE 2: emo_engine.dart — Cognitive Brain: Bigram Q-Table + Cloud Storage
 //
-// Implements command.md §1 (Core Philosophy & Learning Loop):
-//  - Zero Seed: brand-new tokens get their expression from a random
-//    "curiosity experiment", never from a hand-picked default.
-//  - Curiosity-Driven Experimentation: unresolved (non-anchored) tokens are
-//    re-rolled across the full facial + HSL coordinate space every time they
-//    recur, until reinforcement locks them down.
-//  - Slow & Steady Evolution: a Like doesn't snap the word's permanent
-//    profile onto the experimental result — it nudges it there via linear
-//    interpolation at `_slowLearningRate`. Only sustained, repeated Likes
-//    accumulate enough nudges to fully anchor a behavior.
-//  - Human Evaluation Protocol: Like anchors, Dislike penalizes + forces the
-//    engine to go looking for different visual territory next time.
+// This replaces the earlier facial-parameter engine with a genuine
+// zero-knowledge tabular reinforcement learner, in the spirit of the
+// "Zero-Knowledge Emoji Responder" prompt:
+//   - Memory is a flat table: key (word or "w1|w2" bigram) -> {emoji: score}.
+//   - Every decision is either Eksplorasi Acak (random pick from the full
+//     emoji palette) or Eksploitasi Memori (pick the highest-scoring emoji
+//     already known for that key), chosen via an epsilon that shrinks the
+//     more a key has been seen.
+//   - The engine can emit a CHAIN of 1-3 emoji per turn (not just one), and
+//     can also self-emit chains with no user input at all (idle "self-talk").
+//   - A Like/Dislike review always applies to the *last emitted chain* as a
+//     whole, whether that chain was a reply or an idle self-emission.
+//
+// Storage is 100% cloud: Turso (libSQL) over its documented HTTP pipeline
+// API — no local database. See TursoRepository below.
 import 'dart:convert';
 import 'dart:math';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:http/http.dart' as http;
 import 'emo_model.dart';
+import 'emo_emojis.dart';
 
-/// Clean repository interface so storage can be swapped (tests, cloud sync).
-abstract class EmoRepository {
-  Future<void> saveNodes(Map<String, EmoWordNode> nodes);
-  Future<Map<String, EmoWordNode>> loadNodes();
-  Future<void> saveState(EmoState state);
-  Future<EmoState?> loadState();
+/// Fill these via `--dart-define` at build/run time, e.g.:
+///   flutter run \
+///     --dart-define=TURSO_DATABASE_URL=libsql://emoai-hamidstudi0.aws-ap-northeast-1.turso.io \
+///     --dart-define=TURSO_AUTH_TOKEN=eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODMzMTA3MzYsImlkIjoiMDE5ZjM1OWEtMjQwMS03MTk2LWE2YjYtNTdmNTNiMzQwNDNmIiwia2lkIjoiRmZuSXlIb293R1pYRlhGc21TNGoyUHZpakNsNTVCcldMQk1DeHVoekRMdyIsInJpZCI6IjRmNzZmZDJlLTc0M2MtNGYwZC04N2I5LWU0ZWQ0MGUwNzcwNCJ9.2ZBdWc9OmcPC8EayxBeJq5EDStllpDcCpHficIxvsNYFAZYfWHk5VFnx75Yijgce-pIbxGdJun_PnEiFmKXDDQ
+/// If left empty, the engine falls back to an in-memory repository so the
+/// app still runs (without persistence) rather than crashing.
+class TursoConfig {
+  static const databaseUrl = String.fromEnvironment('TURSO_DATABASE_URL');
+  static const authToken = String.fromEnvironment('TURSO_AUTH_TOKEN');
+  static bool get isConfigured => databaseUrl.isNotEmpty && authToken.isNotEmpty;
 }
 
-/// Local, 100%-offline persistence via SharedPreferences.
-class SharedPrefsRepository implements EmoRepository {
-  static const _nodesKey = 'emo_nodes_v2';
-  static const _stateKey = 'emo_state_v2';
+abstract class EmoRepository {
+  Future<void> init();
+  Future<Map<String, EmoMemoryEntry>> loadMemory();
+  Future<void> saveMemory(Map<String, EmoMemoryEntry> memory);
+  Future<EmoState?> loadState();
+  Future<void> saveState(EmoState state);
+}
 
-  @override
-  Future<void> saveNodes(Map<String, EmoWordNode> nodes) async {
-    final prefs = await SharedPreferences.getInstance();
-    final map = nodes.map((k, v) => MapEntry(k, v.toJson()));
-    await prefs.setString(_nodesKey, jsonEncode(map));
+/// Cloud persistence via Turso's documented SQL-over-HTTP pipeline
+/// (`POST {databaseUrl}/v2/pipeline`, Hrana-style typed args/rows):
+/// https://docs.turso.tech/sdk/http/reference
+class TursoRepository implements EmoRepository {
+  final String databaseUrl;
+  final String authToken;
+
+  TursoRepository({required this.databaseUrl, required this.authToken});
+
+  Uri get _endpoint => Uri.parse('$databaseUrl/v2/pipeline');
+
+  Future<Map<String, dynamic>> _pipeline(List<Map<String, dynamic>> statements) async {
+    final res = await http.post(
+      _endpoint,
+      headers: {
+        'Authorization': 'Bearer $authToken',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'requests': [
+          for (final s in statements) {'type': 'execute', 'stmt': s},
+          {'type': 'close'},
+        ],
+      }),
+    );
+    if (res.statusCode != 200) {
+      throw Exception('Turso HTTP ${res.statusCode}: ${res.body}');
+    }
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  Map<String, dynamic> _textArg(String v) => {'type': 'text', 'value': v};
+  Map<String, dynamic> _intArg(int v) => {'type': 'integer', 'value': v.toString()};
+
+  /// Unwraps Hrana's typed cell ({"type": "...", "value": "..."}) to a plain
+  /// Dart value for the columns we actually use (all TEXT/INTEGER).
+  dynamic _cell(dynamic raw) {
+    if (raw is Map && raw.containsKey('value')) return raw['value'];
+    return raw;
+  }
+
+  List<List<dynamic>> _rowsOf(Map<String, dynamic> data, int requestIndex) {
+    final results = data['results'] as List;
+    final entry = results[requestIndex] as Map<String, dynamic>;
+    if (entry['type'] != 'ok') return [];
+    final response = entry['response'] as Map<String, dynamic>;
+    final result = response['result'] as Map<String, dynamic>?;
+    if (result == null) return [];
+    final rows = result['rows'] as List? ?? [];
+    return rows.map((r) => (r as List).map(_cell).toList()).toList();
   }
 
   @override
-  Future<Map<String, EmoWordNode>> loadNodes() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_nodesKey);
-    if (raw == null) return {};
-    final Map<String, dynamic> decoded = jsonDecode(raw);
-    return decoded.map((k, v) => MapEntry(k, EmoWordNode.fromJson(v)));
+  Future<void> init() async {
+    await _pipeline([
+      {
+        'sql': 'CREATE TABLE IF NOT EXISTS emo_memory ('
+            'key TEXT PRIMARY KEY, scores TEXT NOT NULL, freq INTEGER NOT NULL DEFAULT 0)',
+      },
+      {
+        'sql': 'CREATE TABLE IF NOT EXISTS emo_state ('
+            'id INTEGER PRIMARY KEY CHECK (id = 1), '
+            'is_born INTEGER NOT NULL DEFAULT 0, '
+            'name TEXT NOT NULL DEFAULT \'\', '
+            'interaction_count INTEGER NOT NULL DEFAULT 0)',
+      },
+    ]);
   }
 
   @override
-  Future<void> saveState(EmoState state) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_stateKey, jsonEncode(state.toJson()));
+  Future<Map<String, EmoMemoryEntry>> loadMemory() async {
+    final data = await _pipeline([
+      {'sql': 'SELECT key, scores, freq FROM emo_memory'},
+    ]);
+    final rows = _rowsOf(data, 0);
+    final result = <String, EmoMemoryEntry>{};
+    for (final row in rows) {
+      final key = row[0] as String;
+      final scores = jsonDecode(row[1] as String) as Map<String, dynamic>;
+      final freq = int.parse(row[2].toString());
+      result[key] = EmoMemoryEntry.fromJson(key, {'scores': scores, 'freq': freq});
+    }
+    return result;
+  }
+
+  @override
+  Future<void> saveMemory(Map<String, EmoMemoryEntry> memory) async {
+    if (memory.isEmpty) return;
+    final statements = memory.values
+        .map((e) => {
+              'sql': 'INSERT INTO emo_memory (key, scores, freq) VALUES (?, ?, ?) '
+                  'ON CONFLICT(key) DO UPDATE SET scores = excluded.scores, freq = excluded.freq',
+              'args': [_textArg(e.key), _textArg(jsonEncode(e.scores)), _intArg(e.freq)],
+            })
+        .toList();
+    await _pipeline(statements);
   }
 
   @override
   Future<EmoState?> loadState() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_stateKey);
-    if (raw == null) return null;
-    return EmoState.fromJson(jsonDecode(raw));
+    final data = await _pipeline([
+      {'sql': 'SELECT is_born, name, interaction_count FROM emo_state WHERE id = 1'},
+    ]);
+    final rows = _rowsOf(data, 0);
+    if (rows.isEmpty) return null;
+    final row = rows.first;
+    return EmoState(
+      isBorn: row[0].toString() == '1',
+      name: row[1] as String,
+      interactionCount: int.parse(row[2].toString()),
+    );
+  }
+
+  @override
+  Future<void> saveState(EmoState state) async {
+    await _pipeline([
+      {
+        'sql': 'INSERT INTO emo_state (id, is_born, name, interaction_count) VALUES (1, ?, ?, ?) '
+            'ON CONFLICT(id) DO UPDATE SET is_born = excluded.is_born, name = excluded.name, '
+            'interaction_count = excluded.interaction_count',
+        'args': [_intArg(state.isBorn ? 1 : 0), _textArg(state.name), _intArg(state.interactionCount)],
+      },
+    ]);
   }
 }
 
-/// Immutable snapshot of everything the view layer needs to draw one frame
-/// of the face: facial geometry + full HSL color. Produced either straight
-/// from an anchored word's locked-in profile, or from a live curiosity
-/// experiment for a word that hasn't been reinforced yet.
-class ExpressionFrame {
-  final double eyebrowTilt, eyeSize, eyeRotation, mouthDepth, mouthWidth;
-  final double hue, saturation, lightness;
+/// Safety net so the app still runs (without persistence) if Turso isn't
+/// configured yet or a request fails — never crashes on missing cloud config.
+class InMemoryRepository implements EmoRepository {
+  final Map<String, EmoMemoryEntry> _memory = {};
+  EmoState? _state;
 
-  const ExpressionFrame({
-    required this.eyebrowTilt,
-    required this.eyeSize,
-    required this.eyeRotation,
-    required this.mouthDepth,
-    required this.mouthWidth,
-    required this.hue,
-    required this.saturation,
-    required this.lightness,
-  });
+  @override
+  Future<void> init() async {}
 
-  static const neutral = ExpressionFrame(
-    eyebrowTilt: 0.0,
-    eyeSize: 0.5,
-    eyeRotation: 0.0,
-    mouthDepth: 0.0,
-    mouthWidth: 0.45,
-    hue: 42.0,
-    saturation: 0.55,
-    lightness: 0.58,
-  );
+  @override
+  Future<Map<String, EmoMemoryEntry>> loadMemory() async => _memory;
 
-  factory ExpressionFrame.fromNode(EmoWordNode n) => ExpressionFrame(
-        eyebrowTilt: n.eyebrowTilt,
-        eyeSize: n.eyeSize,
-        eyeRotation: n.eyeRotation,
-        mouthDepth: n.mouthDepth,
-        mouthWidth: n.mouthWidth,
-        hue: n.hue,
-        saturation: n.saturation,
-        lightness: n.lightness,
-      );
+  @override
+  Future<void> saveMemory(Map<String, EmoMemoryEntry> memory) async {
+    _memory
+      ..clear()
+      ..addAll(memory);
+  }
 
-  /// Straight linear interpolation toward [target] by factor [t]. Used both
-  /// by the UI's smooth animation and by the engine's own slow-learning step.
-  ExpressionFrame lerpTo(ExpressionFrame target, double t) => ExpressionFrame(
-        eyebrowTilt: eyebrowTilt + (target.eyebrowTilt - eyebrowTilt) * t,
-        eyeSize: eyeSize + (target.eyeSize - eyeSize) * t,
-        eyeRotation: eyeRotation + (target.eyeRotation - eyeRotation) * t,
-        mouthDepth: mouthDepth + (target.mouthDepth - mouthDepth) * t,
-        mouthWidth: mouthWidth + (target.mouthWidth - mouthWidth) * t,
-        hue: hue + (target.hue - hue) * t,
-        saturation: saturation + (target.saturation - saturation) * t,
-        lightness: lightness + (target.lightness - lightness) * t,
-      );
+  @override
+  Future<EmoState?> loadState() async => _state;
+
+  @override
+  Future<void> saveState(EmoState state) async => _state = state;
+}
+
+/// One emitted turn: the emoji glyphs shown, the memory keys that produced
+/// them (parallel list, same length), and whether this was an idle
+/// self-emission rather than a reply to user text.
+class EmoChain {
+  final List<String> emojis;
+  final List<String> keys;
+  final bool isIdle;
+  const EmoChain({required this.emojis, required this.keys, required this.isIdle});
 }
 
 class EmoEngine {
-  final Map<String, EmoWordNode> nodes = {};
+  final Map<String, EmoMemoryEntry> _memory = {};
   EmoState state = EmoState();
   final EmoRepository repo;
   final Random _rng = Random();
 
-  /// Highly-regulated learning rate: a single Like only nudges a word's
-  /// locked profile 3% of the way toward the experimental result. Firmly
-  /// locking down a behavior therefore requires consistent reinforcement
-  /// over many interactions, never an erratic one-shot jump.
-  static const double _slowLearningRate = 0.03;
+  /// Q-learning update rate: how far a Like/Dislike moves a key/emoji score
+  /// toward the +1 / -1 target in one shot. Kept moderate (not instant, not
+  /// glacial) since rewards here are already a clean +1/-1 signal rather
+  /// than a whole profile to blend.
+  static const double _learningRate = 0.25;
 
-  /// Number of Likes (of gradual nudges) needed before a word is considered
-  /// fully "anchored" and stops re-rolling curiosity experiments.
-  static const int _anchorThreshold = 8;
-
-  List<String> _lastTokens = [];
-
-  /// The experimental candidate currently "on trial" for each unanchored
-  /// token — i.e. exactly what the user is looking at right now for that
-  /// word, kept stable until Like/Dislike resolves it or a fresh, unrelated
-  /// experiment is rolled.
-  final Map<String, ExpressionFrame> _pending = {};
+  EmoChain? _pending;
+  EmoChain? get pending => _pending;
 
   EmoEngine(this.repo);
 
   Future<void> init() async {
-    nodes.addAll(await repo.loadNodes());
+    await repo.init();
+    _memory.addAll(await repo.loadMemory());
     final s = await repo.loadState();
     if (s != null) state = s;
   }
 
   Future<void> persist() async {
-    await repo.saveNodes(nodes);
+    await repo.saveMemory(_memory);
     await repo.saveState(state);
   }
 
-  /// Birthing stage (command.md §4): registers the sacred name once, then
-  /// permanently flips the boot flag so the app never asks again.
   Future<void> registerName(String name) async {
     state.isBorn = true;
     state.name = name;
     await persist();
   }
 
-  // 1. Parsing matrix tokenization ------------------------------------------
   List<String> tokenize(String text) => text
       .toLowerCase()
       .split(RegExp(r'[^a-z0-9à-ÿ]+'))
       .where((t) => t.isNotEmpty)
       .toList();
 
-  EmoWordNode _nodeFor(String w) => nodes.putIfAbsent(w, () => EmoWordNode(w));
-
-  double _hueDistance(double a, double b) {
-    final d = (a - b).abs() % 360;
-    return d > 180 ? 360 - d : d;
-  }
-
-  /// Fallback random curiosity experiment selector. Blends brand-new
-  /// eyebrow/eye/mouth coordinates and a full HSL color across the entire
-  /// legal range. If the word carries an accumulated Dislike penalty, the
-  /// hue is resampled until it lands well away from the last rejected
-  /// region, so repeated Dislikes actively push exploration elsewhere.
-  ExpressionFrame _rollExperiment(EmoWordNode n) {
-    double hue = _rng.nextDouble() * 360;
-    if (n.penalty > 0.05) {
-      var tries = 0;
-      while (_hueDistance(hue, n.hue) < 50 && tries < 10) {
-        hue = _rng.nextDouble() * 360;
-        tries++;
-      }
+  /// Unigrams + consecutive bigrams — the "Tabel Ingatan" is keyed on both,
+  /// so the engine can react to a single word as well as short phrases.
+  List<String> _buildKeys(List<String> tokens) {
+    final keys = <String>[];
+    for (var i = 0; i < tokens.length; i++) {
+      keys.add(tokens[i]);
+      if (i + 1 < tokens.length) keys.add('${tokens[i]}|${tokens[i + 1]}');
     }
-    return ExpressionFrame(
-      eyebrowTilt: _rng.nextDouble() * 2 - 1,
-      eyeSize: _rng.nextDouble(),
-      eyeRotation: _rng.nextDouble() * 2 - 1,
-      mouthDepth: _rng.nextDouble() * 2 - 1,
-      mouthWidth: _rng.nextDouble(),
-      hue: hue,
-      saturation: 0.35 + _rng.nextDouble() * 0.55,
-      lightness: 0.35 + _rng.nextDouble() * 0.35,
-    );
+    return keys;
   }
 
-  // 2. Prediction: aggregate word expressions into one face -----------------
-  ExpressionFrame predict(String text) {
+  /// Epsilon-greedy pick for a single key: Eksplorasi Acak vs Eksploitasi
+  /// Memori. Epsilon starts at 1.0 (fully random — zero knowledge) and
+  /// shrinks toward a small floor as the key accumulates exposure.
+  String _pickEmoji(String key) {
+    final entry = _memory.putIfAbsent(key, () => EmoMemoryEntry(key));
+    final epsilon = (1.0 - entry.freq * 0.05).clamp(0.08, 1.0);
+    String emoji;
+    if (entry.scores.isEmpty || _rng.nextDouble() < epsilon) {
+      emoji = kEmojiPalette[_rng.nextInt(kEmojiPalette.length)];
+    } else {
+      emoji = entry.scores.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+    }
+    entry.freq++;
+    return emoji;
+  }
+
+  /// Emits a chain of 1-3 emoji in reply to user text. The chain (and the
+  /// keys that produced it) is kept as `_pending` until the UI reports a
+  /// Like/Dislike, or until it's overwritten by the next chain.
+  EmoChain reply(String text) {
     final tokens = tokenize(text);
-    _lastTokens = tokens;
-    if (tokens.isEmpty) return ExpressionFrame.neutral;
+    final keys = _buildKeys(tokens);
+    if (keys.isEmpty) keys.add('_neutral_');
 
-    double eb = 0, es = 0, er = 0, md = 0, mw = 0, sat = 0, lig = 0;
-    double hueSin = 0, hueCos = 0;
-
-    for (final t in tokens) {
-      final n = _nodeFor(t);
-      n.freq++;
-
-      final ExpressionFrame active;
-      if (n.anchored) {
-        active = ExpressionFrame.fromNode(n);
-      } else {
-        active = _pending.putIfAbsent(t, () => _rollExperiment(n));
-      }
-
-      eb += active.eyebrowTilt;
-      es += active.eyeSize;
-      er += active.eyeRotation;
-      md += active.mouthDepth;
-      mw += active.mouthWidth;
-      sat += active.saturation;
-      lig += active.lightness;
-      final rad = active.hue * pi / 180;
-      hueSin += sin(rad);
-      hueCos += cos(rad);
+    final length = 1 + _rng.nextInt(3);
+    final emojis = <String>[];
+    final usedKeys = <String>[];
+    for (var i = 0; i < length; i++) {
+      final key = keys[_rng.nextInt(keys.length)];
+      emojis.add(_pickEmoji(key));
+      usedKeys.add(key);
     }
 
-    final count = tokens.length;
-    final avgHue = (atan2(hueSin / count, hueCos / count) * 180 / pi + 360) % 360;
-
-    return ExpressionFrame(
-      eyebrowTilt: (eb / count).clamp(-1.0, 1.0),
-      eyeSize: (es / count).clamp(0.0, 1.0),
-      eyeRotation: (er / count).clamp(-1.0, 1.0),
-      mouthDepth: (md / count).clamp(-1.0, 1.0),
-      mouthWidth: (mw / count).clamp(0.0, 1.0),
-      hue: avgHue,
-      saturation: (sat / count).clamp(0.0, 1.0),
-      lightness: (lig / count).clamp(0.0, 1.0),
-    );
+    state.interactionCount++;
+    _pending = EmoChain(emojis: emojis, keys: usedKeys, isIdle: false);
+    return _pending!;
   }
 
-  // 3. Human Evaluation Protocol ---------------------------------------------
-
-  /// Like: anchors the active experimental facial parameters to every token
-  /// in the last input, for future recall. The anchor is applied gradually
-  /// (Lerp at `_slowLearningRate`) so a single Like never causes an abrupt
-  /// visual jump — only sustained reinforcement fully locks the behavior in.
-  void likeCurrent() {
-    if (_lastTokens.isEmpty) return;
-    for (final t in _lastTokens) {
-      final n = _nodeFor(t);
-      final candidate = _pending[t];
-      if (candidate != null) {
-        final blended = ExpressionFrame.fromNode(n).lerpTo(candidate, _slowLearningRate);
-        n.eyebrowTilt = blended.eyebrowTilt;
-        n.eyeSize = blended.eyeSize;
-        n.eyeRotation = blended.eyeRotation;
-        n.mouthDepth = blended.mouthDepth;
-        n.mouthWidth = blended.mouthWidth;
-        n.hue = blended.hue;
-        n.saturation = blended.saturation;
-        n.lightness = blended.lightness;
-      }
-      n.likeCount++;
-      n.penalty = (n.penalty - 0.15).clamp(0.0, 6.0);
-      if (n.likeCount >= _anchorThreshold) n.anchored = true;
-      _pending.remove(t);
+  /// Self-emission with no user input: while "left alone", the entity keeps
+  /// trying other responses on its own, mostly by revisiting keys it
+  /// already has some memory of (so idle chatter still feels connected to
+  /// what it's learned) with occasional fresh exploration.
+  EmoChain autonomous() {
+    final knownKeys = _memory.keys.toList();
+    final length = 1 + _rng.nextInt(2);
+    final emojis = <String>[];
+    final usedKeys = <String>[];
+    for (var i = 0; i < length; i++) {
+      final key = knownKeys.isNotEmpty && _rng.nextDouble() < 0.7
+          ? knownKeys[_rng.nextInt(knownKeys.length)]
+          : '_idle_${_rng.nextInt(99999)}';
+      emojis.add(_pickEmoji(key));
+      usedKeys.add(key);
     }
-    state.interactionCount++;
-    persist();
+    _pending = EmoChain(emojis: emojis, keys: usedKeys, isIdle: true);
+    return _pending!;
   }
 
-  /// Dislike: appends a penalty multiplier to every token in the last input,
-  /// un-anchors it if it had started to settle, and discards its pending
-  /// experiment so the next encounter is forced to seek alternative visual
-  /// boundaries (see `_rollExperiment`'s hue-avoidance logic).
-  void dislikeCurrent() {
-    if (_lastTokens.isEmpty) return;
-    for (final t in _lastTokens) {
-      final n = _nodeFor(t);
-      n.dislikeCount++;
-      n.penalty = (n.penalty + 0.4).clamp(0.0, 6.0);
-      n.anchored = false;
-      _pending.remove(t);
+  /// Applies a Like/Dislike to the last emitted chain as a whole — this is
+  /// valid whether that chain was a reply or an idle self-emission, exactly
+  /// like the spec calls for ("walau respon itu bersifat menunggu ... tetap
+  /// bisa mengulas").
+  void review(bool liked) {
+    final chain = _pending;
+    if (chain == null) return;
+    final reward = liked ? 1.0 : -1.0;
+    for (var i = 0; i < chain.keys.length; i++) {
+      final entry = _memory.putIfAbsent(chain.keys[i], () => EmoMemoryEntry(chain.keys[i]));
+      final emoji = chain.emojis[i];
+      final current = entry.scores[emoji] ?? 0.0;
+      entry.scores[emoji] = current + _learningRate * (reward - current);
     }
-    state.interactionCount++;
+    _pending = null;
     persist();
   }
 }

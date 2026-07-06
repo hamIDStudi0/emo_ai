@@ -1,104 +1,38 @@
 // FILE 1: emo_model.dart — Architecture & State Schema
 //
-// PURE TABULA RASA: every EmoWordNode is born fully neutral. Nothing about
-// how a word "should" look is pre-seeded — every facial trait attached to a
-// token is discovered later, only through the curiosity engine's random
-// experiments plus human Like/Dislike reinforcement (see emo_engine.dart).
-//
-// This file only declares data. No randomness, no learning-rate math, and
-// no UI code live here — that separation is the whole point of the 3-pillar
-// architecture described in command.md.
+// Pure data only. The "brain" here is a classic tabular Q-table: each key
+// (a single word, or a "w1|w2" bigram) owns a map of emoji -> score.
+// Nothing is pre-seeded — a key's score map starts empty and every entry in
+// it is written only by reviewPending() in emo_engine.dart, in response to
+// a real Like/Dislike.
 
-/// A single learned word/token and the facial expression currently bound to
-/// it. Geometric fields are normalized so the view layer can map them
-/// straight onto SVG coordinates without extra scaling logic:
-///   eyebrowTilt : -1.0 (furrowed)      .. 1.0 (raised)
-///   eyeSize     :  0.0 (nearly closed) .. 1.0 (wide open)
-///   eyeRotation : -1.0 (tilt down/in)  .. 1.0 (tilt up/out)
-///   mouthDepth  : -1.0 (deep frown)    .. 1.0 (deep smile)
-///   mouthWidth  :  0.0 (pursed)        .. 1.0 (wide)
-///   hue         :  0 .. 360   (full HSL color wheel)
-///   saturation  :  0.0 .. 1.0 (HSL)
-///   lightness   :  0.0 .. 1.0 (HSL)
-class EmoWordNode {
-  final String word;
+/// One row of the Q-table: `key` is a word or a "w1|w2" bigram; `scores`
+/// maps an emoji glyph to its learned value for that key; `freq` counts how
+/// many times this key has ever been sampled (drives the explore/exploit
+/// epsilon — see emo_engine.dart).
+class EmoMemoryEntry {
+  final String key;
+  Map<String, double> scores;
+  int freq;
 
-  // --- Facial coordinate space, HSL color space ---------------------------
-  double eyebrowTilt;
-  double eyeSize;
-  double eyeRotation;
-  double mouthDepth;
-  double mouthWidth;
-  double hue;
-  double saturation;
-  double lightness;
+  EmoMemoryEntry(this.key, {Map<String, double>? scores, this.freq = 0}) : scores = scores ?? {};
 
-  // --- Analytical feedback weights (curiosity + reinforcement bookkeeping) -
-  int likeCount;
-  int dislikeCount;
-  double penalty; // rises on Dislike; steers future random experiments away
-  bool anchored; // true once reinforcement has "locked" this word's look
-  int freq; // number of times this token has ever been encountered
-
-  EmoWordNode(
-    this.word, {
-    this.eyebrowTilt = 0.0,
-    this.eyeSize = 0.5,
-    this.eyeRotation = 0.0,
-    this.mouthDepth = 0.0,
-    this.mouthWidth = 0.45,
-    this.hue = 42.0,
-    this.saturation = 0.55,
-    this.lightness = 0.58,
-    this.likeCount = 0,
-    this.dislikeCount = 0,
-    this.penalty = 0.0,
-    this.anchored = false,
-    this.freq = 0,
-  });
-
-  factory EmoWordNode.fromJson(Map<String, dynamic> j) => EmoWordNode(
-        j['word'] as String,
-        eyebrowTilt: (j['eyebrowTilt'] as num).toDouble(),
-        eyeSize: (j['eyeSize'] as num).toDouble(),
-        eyeRotation: (j['eyeRotation'] as num).toDouble(),
-        mouthDepth: (j['mouthDepth'] as num).toDouble(),
-        mouthWidth: (j['mouthWidth'] as num).toDouble(),
-        hue: (j['hue'] as num).toDouble(),
-        saturation: (j['saturation'] as num).toDouble(),
-        lightness: (j['lightness'] as num).toDouble(),
-        likeCount: j['likeCount'] as int,
-        dislikeCount: j['dislikeCount'] as int,
-        penalty: (j['penalty'] as num).toDouble(),
-        anchored: j['anchored'] as bool,
+  factory EmoMemoryEntry.fromJson(String key, Map<String, dynamic> j) => EmoMemoryEntry(
+        key,
+        scores: (j['scores'] as Map).map((k, v) => MapEntry(k as String, (v as num).toDouble())),
         freq: j['freq'] as int,
       );
 
   Map<String, dynamic> toJson() => {
-        'word': word,
-        'eyebrowTilt': eyebrowTilt,
-        'eyeSize': eyeSize,
-        'eyeRotation': eyeRotation,
-        'mouthDepth': mouthDepth,
-        'mouthWidth': mouthWidth,
-        'hue': hue,
-        'saturation': saturation,
-        'lightness': lightness,
-        'likeCount': likeCount,
-        'dislikeCount': dislikeCount,
-        'penalty': penalty,
-        'anchored': anchored,
+        'scores': scores,
         'freq': freq,
       };
 }
 
-/// Lifecycle + identity state.
-///
-/// Deliberately holds NO visible-analytics fields. Per command.md §3/§CRITICAL
-/// DIRECTIVES, the app must never surface boredom percentages, stress bars,
-/// or any other numeric readout on the main screen. `isBorn` / `name` exist
-/// purely to gate the one-time birthing ritual (§4); `interactionCount` is
-/// internal bookkeeping only and is never rendered.
+/// Lifecycle + identity state — no visible-analytics fields here either
+/// (see command.md's directive against on-screen numeric readouts).
+/// `isBorn` / `name` gate the one-time birthing ritual; `interactionCount`
+/// is bookkeeping only.
 class EmoState {
   bool isBorn;
   String name;
