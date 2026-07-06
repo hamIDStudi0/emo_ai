@@ -37,47 +37,36 @@ workflows:
           echo "keyPassword=$CM_KEY_PASSWORD" >> android/key.properties
           echo "keyAlias=$CM_KEY_ALIAS" >> android/key.properties
           echo "storeFile=$CM_KEYSTORE_PATH" >> android/key.properties
+          # Memaksa Gradle mengenali format sertifikat .p12 Anda
+          echo "storeType=PKCS12" >> android/key.properties
 
-      - name: 4. Patch build.gradle agar Membaca key.properties
+      - name: 4. Optimasi build.gradle secara Aman (ProGuard & Minify)
         script: |
-          cat >> android/app/build.gradle << 'EOF'
-
-          def keystoreProperties = new Properties()
-          def keystorePropertiesFile = rootProject.file('key.properties')
-          if (keystorePropertiesFile.exists()) {
-              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
-          }
-
-          android {
-              signingConfigs {
-                  release {
-                      keyAlias keystoreProperties['keyAlias']
-                      keyPassword keystoreProperties['keyPassword']
-                      storeFile file(keystoreProperties['storeFile'])
-                      storePassword keystoreProperties['storePassword']
-                      storeType 'PKCS12'
-                  }
-              }
-              buildTypes {
-                  release {
-                      signingConfig signingConfigs.release
-                      minifyEnabled true
-                      shrinkResources true
-                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-                  }
-              }
-          }
-          EOF
+          # Mengaktifkan pengecilan ukuran APK dan pengaburan kode ProGuard langsung di baris rilis bawaan Flutter
+          sed -i '' 's/signingConfig signingConfigs.debug/signingConfig signingConfigs.release/g' android/app/build.gradle
+          
+          # Menyisipkan aturan optimasi biner agar aplikasi lebih ringan dan sulit didekompilasi
+          # Ini memodifikasi blok buildTypes.release bawaan Flutter tanpa merusak strukturnya
+          sed -i '' '/buildTypes {/a\
+          \        release {\
+          \            minifyEnabled true\
+          \            shrinkResources true\
+          \            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"\
+          \        }
+          ' android/app/build.gradle
 
       - name: 5. Unduh Pustaka Dependencies
         script: |
           flutter pub get
 
-      - name: 6. Merakit File APK Rilis
+      - name: 6. Merakit File APK Rilis dengan Proteksi
         script: |
-          flutter build apk --release
+          # Ditambah fitur pengaburan kode bawaan Flutter untuk mengamankan string kode Anda
+          flutter build apk --release \
+            --obfuscate \
+            --split-debug-info=build/app/outputs/symbols
 
-      - name: 7. Verifikasi Signing (opsional, cek di log build)
+      - name: 7. Verifikasi Signing
         script: |
           jarsigner -verify -verbose -certs build/app/outputs/flutter-apk/app-release.apk || true
 
