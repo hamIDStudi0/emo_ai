@@ -65,62 +65,62 @@ workflows:
             echo "Terdeteksi Kotlin DSL (build.gradle.kts)"
             cat >> android/app/build.gradle.kts << 'EOF'
 
-val keystoreProperties = java.util.Properties()
-val keystorePropertiesFile = rootProject.file("key.properties")
-if (keystorePropertiesFile.exists()) {
-    keystoreProperties.load(java.io.FileInputStream(keystorePropertiesFile))
-}
+          val keystoreProperties = java.util.Properties()
+          val keystorePropertiesFile = rootProject.file("key.properties")
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(java.io.FileInputStream(keystorePropertiesFile))
+          }
 
-android {
-    signingConfigs {
-        getByName("release") {
-            keyAlias = keystoreProperties.getProperty("keyAlias")
-            keyPassword = keystoreProperties.getProperty("keyPassword")
-            storeFile = keystoreProperties.getProperty("storeFile")?.let { file(it) }
-            storePassword = keystoreProperties.getProperty("storePassword")
-            storeType = "PKCS12"
-        }
-    }
-    buildTypes {
-        getByName("release") {
-            signingConfig = signingConfigs.getByName("release")
-            isMinifyEnabled = true
-            isShrinkResources = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-        }
-    }
-}
-EOF
+          android {
+              signingConfigs {
+                  getByName("release") {
+                      keyAlias = keystoreProperties.getProperty("keyAlias")
+                      keyPassword = keystoreProperties.getProperty("keyPassword")
+                      storeFile = keystoreProperties.getProperty("storeFile")?.let { file(it) }
+                      storePassword = keystoreProperties.getProperty("storePassword")
+                      storeType = "PKCS12"
+                  }
+              }
+              buildTypes {
+                  getByName("release") {
+                      signingConfig = signingConfigs.getByName("release")
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                  }
+              }
+          }
+          EOF
           else
             echo "Terdeteksi Groovy DSL (build.gradle)"
             cat >> android/app/build.gradle << 'EOF'
 
-def keystoreProperties = new Properties()
-def keystorePropertiesFile = rootProject.file("key.properties")
-if (keystorePropertiesFile.exists()) {
-    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
-}
+          def keystoreProperties = new Properties()
+          def keystorePropertiesFile = rootProject.file("key.properties")
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+          }
 
-android {
-    signingConfigs {
-        release {
-            keyAlias keystoreProperties["keyAlias"]
-            keyPassword keystoreProperties["keyPassword"]
-            storeFile file(keystoreProperties["storeFile"])
-            storePassword keystoreProperties["storePassword"]
-            storeType "PKCS12"
-        }
-    }
-    buildTypes {
-        release {
-            signingConfig signingConfigs.release
-            minifyEnabled true
-            shrinkResources true
-            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
-        }
-    }
-}
-EOF
+          android {
+              signingConfigs {
+                  release {
+                      keyAlias keystoreProperties["keyAlias"]
+                      keyPassword keystoreProperties["keyPassword"]
+                      storeFile file(keystoreProperties["storeFile"])
+                      storePassword keystoreProperties["storePassword"]
+                      storeType "PKCS12"
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                      minifyEnabled true
+                      shrinkResources true
+                      proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+                  }
+              }
+          }
+          EOF
           fi
 
       - name: 5. Unduh Pustaka Dependencies
