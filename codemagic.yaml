@@ -24,7 +24,8 @@ workflows:
     scripts:
       - name: 1. Lahirkan Folder Android Bersih
         script: |
-          flutter create . --platforms=android
+          rm -rf android
+          flutter create . --platforms=android --overwrite
 
       - name: 2. Rekonstruksi File .p12 dari Teks Base64
         script: |
