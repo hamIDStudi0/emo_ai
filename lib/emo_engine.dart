@@ -44,6 +44,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 import 'package:path_provider/path_provider.dart';
 import 'emo_model.dart';
 import 'emo_emojis.dart';
@@ -128,7 +129,7 @@ class ProfileStore {
 
   /// Menyiapkan bytes siap-tulis untuk export (dipakai bareng file_picker's
   /// saveFile di layer UI).
-  static List<int> exportBytes(EmoProfile p) => utf8.encode(jsonEncode(p.toJson()));
+  static Uint8List exportBytes(EmoProfile p) => Uint8List.fromList(utf8.encode(jsonEncode(p.toJson())));
 }
 
 /// Mesin belajar untuk SATU profil yang sedang aktif dibuka.
