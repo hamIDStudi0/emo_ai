@@ -41,31 +41,44 @@ const List<String> kEmotionLabels = ['anger', 'fear', 'happy', 'love', 'sadness'
 const double _kConfidenceThreshold = 0.40;
 
 // ============================================================================
-// IndoBERT — sekarang lewat server self-hosted sendiri (bukan Hugging Face
-// Inference API lagi), supaya tidak kena rate limit HF. Server ini yang
-// menjalankan model, APK cuma manggil endpoint /classify.
+// IndoBERT via Hugging Face Inference API — HANYA deteksi emosi, tidak ada
+// model yang di-bundle ke APK sama sekali (ukuran app tetap kecil).
 // ============================================================================
 class IndoBertClassifier {
-  final String serverUrl; // contoh: https://emo-ai-server.onrender.com
-  IndoBertClassifier(this.serverUrl);
+  static const _modelUrl =
+      'https://api-inference.huggingface.co/models/StevenLimcorn/indonesian-roberta-base-emotion-classifier';
+  final String hfToken;
+  IndoBertClassifier(this.hfToken);
 
+  /// Mengembalikan salah satu dari kEmotionLabels. Kalau API gagal/timeout/
+  /// model masih "cold start", jatuh ke 'netral' — bukan error yang
+  /// menghentikan alur chat.
   Future<String> classify(String text) async {
     try {
       final resp = await http
           .post(
-            Uri.parse('$serverUrl/classify'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'text': text}),
+            Uri.parse(_modelUrl),
+            headers: {
+              'Authorization': 'Bearer $hfToken',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({'inputs': text}),
           )
-          // Timeout dilonggarkan karena server bisa "cold start" ~30-60 detik
-          // kalau baru bangun dari sleep (walau ada keep-alive, sesekali
-          // masih bisa kejadian).
-          .timeout(const Duration(seconds: 60));
+          .timeout(const Duration(seconds: 12));
 
       if (resp.statusCode != 200) return 'netral';
       final decoded = jsonDecode(resp.body);
-      final label = (decoded['label'] as String).toLowerCase();
-      final score = (decoded['score'] as num).toDouble();
+
+      // Format HF kadang list-of-list, kadang list biasa — tangani dua-duanya.
+      final List<dynamic> preds = (decoded is List && decoded.isNotEmpty && decoded.first is List)
+          ? decoded.first as List<dynamic>
+          : (decoded is List ? decoded : []);
+      if (preds.isEmpty) return 'netral';
+
+      preds.sort((a, b) => (b['score'] as num).compareTo(a['score'] as num));
+      final top = preds.first;
+      final label = (top['label'] as String).toLowerCase();
+      final score = (top['score'] as num).toDouble();
 
       if (score < _kConfidenceThreshold) return 'netral';
       return kEmotionLabels.contains(label) ? label : 'netral';

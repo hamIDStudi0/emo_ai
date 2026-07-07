@@ -5,7 +5,7 @@ import 'emo_view.dart';
 
 // Kredensial disuntik saat build lewat --dart-define (lihat codemagic.yaml)
 // — TIDAK di-hardcode di source code.
-const String _serverUrl = String.fromEnvironment('EMO_SERVER_URL', defaultValue: '');
+const String _hfToken = String.fromEnvironment('HF_TOKEN', defaultValue: '');
 const String _tursoUrl = String.fromEnvironment('TURSO_DATABASE_URL', defaultValue: '');
 const String _tursoToken = String.fromEnvironment('TURSO_AUTH_TOKEN', defaultValue: '');
 
@@ -51,7 +51,7 @@ class _AppRootState extends State<_AppRoot> {
 
   Future<void> _boot() async {
     final engine = EmoEngine(
-      classifier: IndoBertClassifier(_serverUrl),
+      classifier: IndoBertClassifier(_hfToken),
       store: TursoStore(databaseUrl: _tursoUrl, authToken: _tursoToken),
     );
     try {
