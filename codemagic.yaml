@@ -114,6 +114,19 @@ workflows:
               if n2 == 0:
                   print("PERINGATAN: baris signingConfig debug default tidak ditemukan — cek manual build.gradle.kts")
 
+              # file_picker (lewat flutter_plugin_android_lifecycle) minta
+              # compileSdk >= 36, sementara default Flutter masih memakai
+              # flutter.compileSdkVersion (biasanya 34). SDK 36 sudah otomatis
+              # ter-install oleh Codemagic di step Gradle sebelumnya — di sini
+              # cukup arahkan compileSdk project ke 36 secara eksplisit.
+              text, n_sdk = re.subn(
+                  r'compileSdk\s*=\s*flutter\.compileSdkVersion',
+                  'compileSdk = 36',
+                  text,
+              )
+              if n_sdk == 0:
+                  print("PERINGATAN: baris compileSdk default tidak ditemukan — cek manual build.gradle.kts")
+
               if "isMinifyEnabled" not in text:
                   text, _ = re.subn(
                       r'(signingConfig = signingConfigs\.getByName\("release"\))',
@@ -153,6 +166,13 @@ workflows:
               )
               if n2 == 0:
                   print("PERINGATAN: baris signingConfig debug default tidak ditemukan — cek manual build.gradle")
+              text, n_sdk = re.subn(
+                  r'compileSdkVersion\s+flutter\.compileSdkVersion',
+                  'compileSdkVersion 36',
+                  text,
+              )
+              if n_sdk == 0:
+                  print("PERINGATAN: baris compileSdkVersion default tidak ditemukan — cek manual build.gradle")
               if "minifyEnabled" not in text:
                   text, _ = re.subn(
                       r'(signingConfig signingConfigs\.release)',
