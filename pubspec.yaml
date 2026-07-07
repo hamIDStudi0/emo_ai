@@ -1,5 +1,5 @@
 name: emo_ai
-description: "emo.ai — cloud-backed, curiosity-driven emoji entity (Flutter)."
+description: "emo.ai — 100% offline, curiosity-driven emoji entity (Flutter)."
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -9,7 +9,8 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  http: ^1.2.0
+  path_provider: ^2.1.3
+  file_picker: ^8.0.0
 
 dev_dependencies:
   flutter_test:

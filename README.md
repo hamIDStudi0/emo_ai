@@ -1,48 +1,51 @@
 # emo.ai
 
-100% offline, self-evolving emotional AI companion for Android (Flutter).
-Starts with **zero pre-seeded data** — every word, expression, and answer
-probability is learned purely from your "Ya" / "Tidak" / "Mungkin" feedback.
+100% offline emoji companion for Android (Flutter). Tidak ada koneksi
+internet, tidak ada database eksternal — semua data hidup di file lokal
+`.emoai` di penyimpanan perangkat. Mendukung banyak "AI" (profil) sekaligus
+di satu perangkat, masing-masing diidentifikasi dengan avatar emoji (bukan
+nama teks), plus export/import antar perangkat lewat file `.emoai`.
 
-## Structure
+## Struktur
 ```
 lib/
-  emo_model.dart   # EmoWordNode + EmoState data schema
-  emo_engine.dart  # tokenizer, co-occurrence graph, learning, rebellion, homeostasis, storage
-  emo_view.dart    # dynamic SVG face (animated) + chat UI
+  emo_model.dart   # EmoProfile (per-AI) + EmoMemoryEntry data schema
+  emo_engine.dart  # tokenizer, weighting emergent, co-occurrence, learning, storage lokal
+  emo_view.dart    # boot screen animasi, beranda profil (ikon-saja), layar interaksi
   main.dart        # app entry point
 ```
 
-## Run
+## Menjalankan
 ```bash
 flutter pub get
-flutter run          # plug in an Android device/emulator
+flutter run
 ```
 
-To build a release APK:
+Build APK rilis:
 ```bash
 flutter build apk --release
 ```
 
-## How it works
-- Type a message → `EmoEngine.predict()` tokenizes it, aggregates the known
-  weight of each word (plus anything linked to it via the co-occurrence
-  graph) into eyebrows / eye-openness / mouth-curve / color values in
-  `[-1, 1]`, and the face redraws itself as a fresh SVG, smoothly
-  interpolating from the previous expression.
-- Tap **Ya / Tidak / Mungkin** → `EmoEngine.learn()` nudges every word from
-  that sentence toward the reaction associated with your feedback. If the
-  AI's prediction was very wrong, it's an "Emotional Shock" and the
-  learning rate doubles for that update.
-- Every learning step has a small (5%+) chance of **Stochastic Rebellion** —
-  weights invert, mutate randomly, and the face flashes crimson red. The
-  chance rises the more bored or stressed the AI's homeostasis state gets.
-- `EmoEngine.tickHomeostasis()` can be called on a timer to let stress and
-  boredom drift back toward equilibrium on their own between messages.
+## Cara kerja
+- **Tidak ada daftar kata hardcoded** (tidak ada stopword/sinonim/antonim
+  buatan manusia di kode). Setiap kata mulai dengan bobot sama; bobot yang
+  "terasa penting" nantinya murni lahir dari seberapa konsisten reaksi
+  like/dislike yang pernah diterima kata itu — lihat komentar panjang di
+  atas `emo_engine.dart` untuk penjelasan jujur soal apa yang benar-benar
+  dilakukan (dan apa yang TIDAK dilakukan) sistem ini.
+- Generalisasi ke kata baru yang belum pernah dinilai memakai peta
+  co-occurrence (kata yang sering muncul berdekatan) sebagai "firasat" —
+  analogi paling jujur dari mengenali kata mirip tanpa kamus.
+- **Beranda** menampilkan grid avatar (emoji) semua profil di perangkat ini,
+  tanpa teks apa pun — cukup ketuk avatar untuk masuk, tekan lama untuk
+  hapus, tombol "+" untuk menambah (pilih Import file `.emoai` atau Baru).
+- **Export**: dari layar interaksi, tombol share di kanan atas menyimpan
+  seluruh memori profil itu sebagai file `.emoai` (JSON) yang bisa dipindah
+  ke perangkat lain dan di-import di sana.
 
-## Notes / things you may want to tune
-- The face SVG is rebuilt as a raw string on every animation frame for
-  transparency and 0-byte-asset purity; if you want max render performance
-  on very low-end devices, consider caching identical strings or switching
-  the SVG markup to a `CustomPainter`.
-- Storage is local-only (`SharedPreferences`) — nothing leaves the device.
+## Privasi & Play Protect
+Karena tidak ada permission INTERNET yang dipakai (aplikasi memang tidak
+tahu cara connect ke jaringan), salah satu pemicu Play Protect yang paling
+umum untuk app kecil (kirim data ke server tak dikenal) tidak berlaku di
+sini. Lihat `GOOGLE_PLAY_PROTECT.md` untuk penyebab lain yang masih relevan
+(signing key, distribusi di luar Play Store, dsb).

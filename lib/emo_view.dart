@@ -1,343 +1,49 @@
-// FILE 3: emo_view.dart — Emoji Stage, Idle Self-Talk & Review Notification
+// FILE 3: emo_view.dart — UI layer.
 //
-// The face is gone; the stage now shows real emoji glyphs (device's own
-// color emoji font — zero bundled assets, same "0-byte" spirit as before).
-// Two animation problems from the previous version are fixed here:
-//   1. Entrances/exits now use non-linear easing (easeOutBack / easeInCubic)
-//      instead of a flat linear lerp, and each emoji in a chain pops in
-//      with a small stagger instead of all snapping in at once.
-//   2. A chain can contain 2+ emoji, and the entity keeps emitting chains on
-//      its own while idle — not just in reply to messages.
-// A review banner slides down from the top exactly when the *current*
-// chain has finished animating in, whether that chain was a reply or an
-// idle self-emission, and Like/Dislike always apply to that whole chain.
-import 'dart:async';
+// Alur: Boot (animasi) -> Beranda daftar profil (ikon avatar SAJA, tanpa
+// teks apa pun, supaya language-neutral) -> tombol "+" ikon -> lembar pilihan
+// Import / Baru (ikon saja) -> layar interaksi per-profil.
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 import 'emo_engine.dart';
+import 'emo_model.dart';
+import 'emo_emojis.dart';
 
-/// Pops a single emoji in with a bouncy scale + fade after `delay`, so a
-/// multi-emoji chain reads as "arriving" one after another rather than
-/// snapping onto the screen as a block.
-class StaggeredEmoji extends StatefulWidget {
-  final String emoji;
-  final Duration delay;
-  const StaggeredEmoji({super.key, required this.emoji, required this.delay});
+const _kBg = Color(0xFF0D0F14);
+const _kAccent = Colors.amber;
 
+/// Subset avatar yang dipakai khusus untuk mewakili tiap profil (wajah/
+/// makhluk saja, supaya tetap terasa seperti "identitas", bukan emoji acak
+/// seperti buah/objek).
+const List<String> _kAvatarChoices = [
+  '🤖', '👻', '🐶', '🐱', '🦊', '🐼', '🐯', '🐨', '🦄', '🐸', '🐵', '🐰',
+  '😺', '🐧', '🦋', '🐢', '👽', '🦁', '🐹', '🦋',
+];
+
+// ============================================================================
+// BOOT SCREEN — beberapa lapis animasi berjalan bersamaan (ripple berlapis,
+// logo berdenyut, progress indeterminate, titik loading bergilir, partikel
+// mengambang halus) supaya terasa hidup seperti layar booting Android TV.
+// ============================================================================
+class BootScreen extends StatefulWidget {
+  const BootScreen({super.key});
   @override
-  State<StaggeredEmoji> createState() => _StaggeredEmojiState();
+  State<BootScreen> createState() => _BootScreenState();
 }
 
-class _StaggeredEmojiState extends State<StaggeredEmoji> {
-  bool _shown = false;
-  Timer? _timer;
-
-  @override
-  void initState() {
-    super.initState();
-    _timer = Timer(widget.delay, () {
-      if (mounted) setState(() => _shown = true);
-    });
-  }
-
-  @override
-  void dispose() {
-    _timer?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedScale(
-      scale: _shown ? 1.0 : 0.0,
-      duration: const Duration(milliseconds: 420),
-      curve: Curves.easeOutBack,
-      child: AnimatedOpacity(
-        opacity: _shown ? 1.0 : 0.0,
-        duration: const Duration(milliseconds: 260),
-        curve: Curves.easeOut,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 6),
-          child: Text(widget.emoji, style: const TextStyle(fontSize: 56)),
-        ),
-      ),
-    );
-  }
-}
-
-/// Displays the current chain as a row of [StaggeredEmoji], and swaps
-/// whole chains (reply <-> idle <-> next reply) through an [AnimatedSwitcher]
-/// so the outgoing chain shrinks/fades away (easeInCubic) instead of just
-/// vanishing, while the incoming one pops in with easeOutBack.
-class EmojiStage extends StatelessWidget {
-  final EmoChain? chain;
-  final int generation;
-  const EmojiStage({super.key, required this.chain, required this.generation});
-
-  @override
-  Widget build(BuildContext context) {
-    final current = chain;
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 320),
-      switchInCurve: Curves.easeOutBack,
-      switchOutCurve: Curves.easeInCubic,
-      transitionBuilder: (child, animation) => ScaleTransition(
-        scale: animation,
-        child: FadeTransition(opacity: animation, child: child),
-      ),
-      child: current == null
-          ? const SizedBox(key: ValueKey('empty'), width: 1, height: 1)
-          : Row(
-              key: ValueKey(generation),
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                for (var i = 0; i < current.emojis.length; i++)
-                  StaggeredEmoji(
-                    emoji: current.emojis[i],
-                    delay: Duration(milliseconds: i * 130),
-                  ),
-              ],
-            ),
-    );
-  }
-}
-
-// Catatan: layar "beri nama" sebelumnya DIHAPUS atas permintaan — proses
-// kelahiran kini otomatis lewat `EmoEngine.autoBornIfNeeded()` di
-// emo_engine.dart, tanpa meminta nama apa pun. Ini sejalan dengan permintaan
-// agar data yang tersimpan di Turso (termasuk log ulasan) benar-benar
-// anonim, tidak terikat pada identitas siapa pun.
-
-class EmoHomeScreen extends StatefulWidget {
-  final EmoEngine engine;
-  const EmoHomeScreen({super.key, required this.engine});
-
-  @override
-  State<EmoHomeScreen> createState() => _EmoHomeScreenState();
-}
-
-class _EmoHomeScreenState extends State<EmoHomeScreen> {
-  final TextEditingController _inputCtrl = TextEditingController();
-
-  EmoChain? _chain;
-  int _generation = 0;
-  bool _sheetOpen = false;
-  bool _reviewVisible = false;
-
-  Timer? _idleTimer;
-  Timer? _reviewRevealTimer;
-
-  @override
-  void initState() {
-    super.initState();
-    _scheduleIdle();
-  }
-
-  @override
-  void dispose() {
-    _idleTimer?.cancel();
-    _reviewRevealTimer?.cancel();
-    _inputCtrl.dispose();
-    super.dispose();
-  }
-
-  /// Idle self-talk: while left alone, the entity keeps trying other
-  /// responses on its own at random intervals. Any user interaction
-  /// (sending a message) resets this timer.
-  void _scheduleIdle() {
-    _idleTimer?.cancel();
-    _idleTimer = Timer(Duration(seconds: 18 + DateTime.now().millisecond % 20), () {
-      if (!mounted) return;
-      _emit(widget.engine.autonomous());
-      _scheduleIdle();
-    });
-  }
-
-  /// Shared by both replies and idle self-emissions: shows the new chain,
-  /// then reveals the review notification once the chain has fully
-  /// finished popping in ("array respon selesai").
-  void _emit(EmoChain chain) {
-    _reviewRevealTimer?.cancel();
-    setState(() {
-      _chain = chain;
-      _generation++;
-      _reviewVisible = false;
-    });
-    final totalPopInMs = chain.emojis.length * 130 + 420;
-    _reviewRevealTimer = Timer(Duration(milliseconds: totalPopInMs), () {
-      if (!mounted) return;
-      setState(() => _reviewVisible = true);
-    });
-  }
-
-  void _send() {
-    final text = _inputCtrl.text.trim();
-    if (text.isEmpty) return;
-    _inputCtrl.clear();
-    setState(() => _sheetOpen = false);
-    _emit(widget.engine.reply(text));
-    _scheduleIdle();
-  }
-
-  void _review(bool liked) {
-    widget.engine.review(liked);
-    setState(() => _reviewVisible = false);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF0D0F14),
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          Center(child: EmojiStage(chain: _chain, generation: _generation)),
-          _buildReviewBanner(),
-          _buildBottomSheet(),
-        ],
-      ),
-    );
-  }
-
-  /// Unobtrusive-but-visible review notification: slides down from the top
-  /// only once the current chain (reply OR idle) has finished displaying,
-  /// and always evaluates that whole chain — reply or self-talk alike.
-  Widget _buildReviewBanner() {
-    return AnimatedPositioned(
-      duration: const Duration(milliseconds: 380),
-      curve: _reviewVisible ? Curves.easeOutBack : Curves.easeInCubic,
-      top: _reviewVisible ? 0 : -120,
-      left: 0,
-      right: 0,
-      child: SafeArea(
-        child: Center(
-          child: Container(
-            margin: const EdgeInsets.only(top: 8),
-            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1A1D24),
-              borderRadius: BorderRadius.circular(20),
-              boxShadow: const [BoxShadow(color: Colors.black45, blurRadius: 12)],
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  _chain?.isIdle == true ? 'Ekspresi iseng ini pas?' : 'Responnya pas?',
-                  style: const TextStyle(color: Colors.white70),
-                ),
-                const SizedBox(width: 12),
-                IconButton(
-                  icon: const Icon(Icons.thumb_up_alt_outlined, color: Colors.greenAccent, size: 20),
-                  onPressed: () => _review(true),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.thumb_down_alt_outlined, color: Colors.redAccent, size: 20),
-                  onPressed: () => _review(false),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildBottomSheet() {
-    return AnimatedPositioned(
-      duration: const Duration(milliseconds: 320),
-      curve: Curves.easeInOutCubic,
-      left: 0,
-      right: 0,
-      bottom: 0,
-      height: _sheetOpen ? 160 : 46,
-      child: GestureDetector(
-        onTap: () => setState(() => _sheetOpen = !_sheetOpen),
-        onVerticalDragUpdate: (d) {
-          if (d.delta.dy < -4 && !_sheetOpen) setState(() => _sheetOpen = true);
-          if (d.delta.dy > 4 && _sheetOpen) setState(() => _sheetOpen = false);
-        },
-        child: Container(
-          decoration: const BoxDecoration(
-            color: Color(0xFF1A1D24),
-            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-          ),
-          child: Column(
-            children: [
-              const SizedBox(height: 8),
-              Container(
-                width: 40,
-                height: 4,
-                decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(2)),
-              ),
-              Icon(
-                _sheetOpen ? Icons.keyboard_arrow_down : Icons.keyboard_arrow_up,
-                color: Colors.white38,
-                size: 18,
-              ),
-              if (_sheetOpen)
-                Expanded(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            decoration: BoxDecoration(
-                              color: Colors.white10,
-                              borderRadius: BorderRadius.circular(24),
-                            ),
-                            child: TextField(
-                              controller: _inputCtrl,
-                              style: const TextStyle(color: Colors.white),
-                              decoration: const InputDecoration(
-                                border: InputBorder.none,
-                                hintText: 'Ketik sesuatu...',
-                                hintStyle: TextStyle(color: Colors.white38),
-                              ),
-                              onSubmitted: (_) => _send(),
-                            ),
-                          ),
-                        ),
-                        IconButton(icon: const Icon(Icons.send, color: Colors.amber), onPressed: _send),
-                      ],
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// Layar boot bergaya "Android TV": logo yang berdenyut (pulse), beberapa
-/// cincin yang mengembang dan memudar berurutan (ripple), garis progres
-/// yang mengisi dari kiri, serta titik-titik loading yang menyala bergilir.
-/// Semuanya CSS-free (murni Flutter `AnimationController`), tidak butuh
-/// aset gambar apa pun — konsisten dengan semangat "zero-asset" proyek ini.
-class _BootScreen extends StatefulWidget {
-  const _BootScreen();
-
-  @override
-  State<_BootScreen> createState() => _BootScreenState();
-}
-
-class _BootScreenState extends State<_BootScreen> with TickerProviderStateMixin {
+class _BootScreenState extends State<BootScreen> with TickerProviderStateMixin {
   late final AnimationController _pulseCtrl;
   late final AnimationController _rippleCtrl;
   late final AnimationController _dotsCtrl;
+  late final AnimationController _floatCtrl;
 
   @override
   void initState() {
     super.initState();
-    _pulseCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1400))
-      ..repeat(reverse: true);
-    _rippleCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 2200))
-      ..repeat();
-    _dotsCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))
-      ..repeat();
+    _pulseCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1400))..repeat(reverse: true);
+    _rippleCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 2200))..repeat();
+    _dotsCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))..repeat();
+    _floatCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 3600))..repeat();
   }
 
   @override
@@ -345,101 +51,481 @@ class _BootScreenState extends State<_BootScreen> with TickerProviderStateMixin 
     _pulseCtrl.dispose();
     _rippleCtrl.dispose();
     _dotsCtrl.dispose();
+    _floatCtrl.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF0D0F14),
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SizedBox(
-              width: 180,
-              height: 180,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  // Tiga cincin ripple, masing-masing dengan offset fase
-                  // berbeda supaya terlihat "mengembang berurutan" seperti
-                  // logo boot Android TV.
-                  for (final phase in [0.0, 0.33, 0.66])
-                    AnimatedBuilder(
-                      animation: _rippleCtrl,
-                      builder: (context, _) {
-                        final t = (_rippleCtrl.value + phase) % 1.0;
-                        return Opacity(
-                          opacity: (1.0 - t) * 0.6,
-                          child: Container(
-                            width: 70 + t * 110,
-                            height: 70 + t * 110,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              border: Border.all(color: Colors.amber, width: 2),
-                            ),
+      backgroundColor: _kBg,
+      body: Stack(
+        children: [
+          // Partikel mengambang halus di latar belakang.
+          AnimatedBuilder(
+            animation: _floatCtrl,
+            builder: (context, _) {
+              return CustomPaint(
+                size: Size.infinite,
+                painter: _FloatingParticlesPainter(_floatCtrl.value),
+              );
+            },
+          ),
+          Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 180,
+                  height: 180,
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      for (final phase in [0.0, 0.33, 0.66])
+                        AnimatedBuilder(
+                          animation: _rippleCtrl,
+                          builder: (context, _) {
+                            final t = (_rippleCtrl.value + phase) % 1.0;
+                            return Opacity(
+                              opacity: (1.0 - t) * 0.6,
+                              child: Container(
+                                width: 70 + t * 110,
+                                height: 70 + t * 110,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  border: Border.all(color: _kAccent, width: 2),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      AnimatedBuilder(
+                        animation: _pulseCtrl,
+                        builder: (context, child) {
+                          final scale = 0.92 + _pulseCtrl.value * 0.16;
+                          return Transform.scale(scale: scale, child: child);
+                        },
+                        child: const Text('🤖', style: TextStyle(fontSize: 64)),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 36),
+                SizedBox(
+                  width: 160,
+                  height: 4,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(2),
+                    child: const LinearProgressIndicator(
+                      value: null,
+                      backgroundColor: Colors.white10,
+                      valueColor: AlwaysStoppedAnimation(_kAccent),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+                AnimatedBuilder(
+                  animation: _dotsCtrl,
+                  builder: (context, _) {
+                    final active = (_dotsCtrl.value * 3).floor() % 3;
+                    return Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: List.generate(3, (i) {
+                        final isActive = i == active;
+                        return AnimatedContainer(
+                          duration: const Duration(milliseconds: 200),
+                          curve: Curves.easeOutCubic,
+                          margin: const EdgeInsets.symmetric(horizontal: 4),
+                          width: isActive ? 10 : 7,
+                          height: isActive ? 10 : 7,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: isActive ? _kAccent : Colors.white24,
                           ),
                         );
-                      },
+                      }),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FloatingParticlesPainter extends CustomPainter {
+  final double t;
+  _FloatingParticlesPainter(this.t);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..color = Colors.amber.withOpacity(0.12);
+    for (var i = 0; i < 14; i++) {
+      final seed = i * 137.5;
+      final x = (size.width * ((seed % 100) / 100));
+      final phase = (t + i / 14) % 1.0;
+      final y = size.height * (1 - phase);
+      final r = 2.0 + (i % 4);
+      canvas.drawCircle(Offset(x, y), r, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _FloatingParticlesPainter oldDelegate) => oldDelegate.t != t;
+}
+
+// ============================================================================
+// BERANDA — grid avatar profil, ikon-saja, plus tombol "+" ikon-saja.
+// ============================================================================
+class ProfileHomeScreen extends StatefulWidget {
+  const ProfileHomeScreen({super.key});
+  @override
+  State<ProfileHomeScreen> createState() => _ProfileHomeScreenState();
+}
+
+class _ProfileHomeScreenState extends State<ProfileHomeScreen> {
+  List<EmoProfile>? _profiles;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final list = await ProfileStore.listProfiles();
+    if (mounted) setState(() => _profiles = list);
+  }
+
+  Future<void> _openAddSheet() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: _kBg,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (context) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 28, horizontal: 24),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              _IconChoiceButton(
+                icon: Icons.file_open_rounded,
+                tooltip: 'Import',
+                onTap: () => Navigator.pop(context, 'import'),
+              ),
+              _IconChoiceButton(
+                icon: Icons.auto_awesome_rounded,
+                tooltip: 'Baru',
+                onTap: () => Navigator.pop(context, 'new'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (choice == 'new') {
+      await _createNew();
+    } else if (choice == 'import') {
+      await _import();
+    }
+  }
+
+  Future<void> _createNew() async {
+    final avatar = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: _kBg,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (context) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 14,
+            runSpacing: 14,
+            children: _kAvatarChoices
+                .map((e) => GestureDetector(
+                      onTap: () => Navigator.pop(context, e),
+                      child: CircleAvatar(
+                        radius: 28,
+                        backgroundColor: Colors.white10,
+                        child: Text(e, style: const TextStyle(fontSize: 28)),
+                      ),
+                    ))
+                .toList(),
+          ),
+        ),
+      ),
+    );
+    if (avatar == null) return;
+    await ProfileStore.createNew(avatar);
+    await _load();
+  }
+
+  Future<void> _import() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['emoai'],
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final bytes = result.files.first.bytes;
+    if (bytes == null) return;
+    try {
+      await ProfileStore.importFromBytes(bytes);
+      await _load();
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('File tidak valid')),
+        );
+      }
+    }
+  }
+
+  Future<void> _deleteProfile(EmoProfile p) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: _kBg,
+        content: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.close_rounded, color: Colors.white54, size: 32),
+              onPressed: () => Navigator.pop(context, false),
+            ),
+            IconButton(
+              icon: const Icon(Icons.delete_forever_rounded, color: Colors.redAccent, size: 32),
+              onPressed: () => Navigator.pop(context, true),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (confirm == true) {
+      await ProfileStore.delete(p.id);
+      await _load();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final profiles = _profiles;
+    return Scaffold(
+      backgroundColor: _kBg,
+      floatingActionButton: FloatingActionButton(
+        backgroundColor: _kAccent,
+        onPressed: _openAddSheet,
+        child: const Icon(Icons.add_rounded, color: Colors.black),
+      ),
+      body: SafeArea(
+        child: profiles == null
+            ? const Center(child: CircularProgressIndicator(color: _kAccent))
+            : profiles.isEmpty
+                ? Center(
+                    child: TweenAnimationBuilder<double>(
+                      tween: Tween(begin: 0, end: 1),
+                      duration: const Duration(milliseconds: 600),
+                      curve: Curves.easeOutBack,
+                      builder: (context, v, child) => Opacity(opacity: v.clamp(0, 1), child: Transform.scale(scale: 0.7 + 0.3 * v, child: child)),
+                      child: const Text('➕', style: TextStyle(fontSize: 48, color: Colors.white24)),
                     ),
-                  // Logo/emoji inti yang berdenyut pelan.
-                  AnimatedBuilder(
-                    animation: _pulseCtrl,
-                    builder: (context, child) {
-                      final scale = 0.92 + _pulseCtrl.value * 0.16;
-                      return Transform.scale(scale: scale, child: child);
+                  )
+                : GridView.builder(
+                    padding: const EdgeInsets.all(20),
+                    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: 3,
+                      mainAxisSpacing: 18,
+                      crossAxisSpacing: 18,
+                    ),
+                    itemCount: profiles.length,
+                    itemBuilder: (context, i) {
+                      final p = profiles[i];
+                      return TweenAnimationBuilder<double>(
+                        tween: Tween(begin: 0, end: 1),
+                        duration: Duration(milliseconds: 350 + i * 60),
+                        curve: Curves.easeOutBack,
+                        builder: (context, v, child) => Opacity(
+                          opacity: v.clamp(0, 1),
+                          child: Transform.scale(scale: 0.6 + 0.4 * v, child: child),
+                        ),
+                        child: GestureDetector(
+                          onTap: () async {
+                            await Navigator.push(
+                              context,
+                              PageRouteBuilder(
+                                transitionDuration: const Duration(milliseconds: 350),
+                                pageBuilder: (_, anim, __) => FadeTransition(
+                                  opacity: anim,
+                                  child: EmoInteractionScreen(engine: EmoEngine(p)),
+                                ),
+                              ),
+                            );
+                            _load();
+                          },
+                          onLongPress: () => _deleteProfile(p),
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: Colors.white10,
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            alignment: Alignment.center,
+                            child: Text(p.avatar, style: const TextStyle(fontSize: 36)),
+                          ),
+                        ),
+                      );
                     },
-                    child: const Text('🤖', style: TextStyle(fontSize: 64)),
+                  ),
+      ),
+    );
+  }
+}
+
+class _IconChoiceButton extends StatelessWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+  const _IconChoiceButton({required this.icon, required this.tooltip, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(28),
+        onTap: onTap,
+        child: Container(
+          width: 84,
+          height: 84,
+          decoration: BoxDecoration(color: Colors.white10, borderRadius: BorderRadius.circular(28)),
+          child: Icon(icon, color: _kAccent, size: 36),
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// LAYAR INTERAKSI per-profil — chat sederhana + tombol export (ikon).
+// ============================================================================
+class EmoInteractionScreen extends StatefulWidget {
+  final EmoEngine engine;
+  const EmoInteractionScreen({super.key, required this.engine});
+
+  @override
+  State<EmoInteractionScreen> createState() => _EmoInteractionScreenState();
+}
+
+class _EmoInteractionScreenState extends State<EmoInteractionScreen> with SingleTickerProviderStateMixin {
+  final TextEditingController _ctrl = TextEditingController();
+  String? _emojis;
+  bool _awaitingReview = false;
+  late final AnimationController _revealCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _revealCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 450));
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    _revealCtrl.dispose();
+    super.dispose();
+  }
+
+  void _send() {
+    final text = _ctrl.text.trim();
+    if (text.isEmpty) return;
+    final chain = widget.engine.reply(text);
+    setState(() {
+      _emojis = chain.emojis.join(' ');
+      _awaitingReview = true;
+    });
+    _revealCtrl.forward(from: 0);
+    _ctrl.clear();
+  }
+
+  void _review(bool liked) {
+    widget.engine.review(liked);
+    setState(() => _awaitingReview = false);
+  }
+
+  Future<void> _export() async {
+    final bytes = ProfileStore.exportBytes(widget.engine.profile);
+    final path = await FilePicker.platform.saveFile(
+      fileName: '${widget.engine.profile.avatar.hashCode}.emoai',
+      bytes: bytes,
+    );
+    if (mounted && path != null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Berhasil diekspor')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: _kBg,
+      appBar: AppBar(
+        backgroundColor: _kBg,
+        elevation: 0,
+        title: Text(widget.engine.profile.avatar, style: const TextStyle(fontSize: 22)),
+        actions: [
+          IconButton(icon: const Icon(Icons.ios_share_rounded, color: Colors.white70), onPressed: _export),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(
+              child: Center(
+                child: _emojis == null
+                    ? const Text('...', style: TextStyle(color: Colors.white24, fontSize: 40))
+                    : ScaleTransition(
+                        scale: CurvedAnimation(parent: _revealCtrl, curve: Curves.elasticOut),
+                        child: Text(_emojis!, style: const TextStyle(fontSize: 52)),
+                      ),
+              ),
+            ),
+            if (_awaitingReview)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    _ReviewButton(icon: Icons.thumb_down_rounded, color: Colors.redAccent, onTap: () => _review(false)),
+                    _ReviewButton(icon: Icons.thumb_up_rounded, color: Colors.greenAccent, onTap: () => _review(true)),
+                  ],
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _ctrl,
+                      style: const TextStyle(color: Colors.white),
+                      onSubmitted: (_) => _send(),
+                      decoration: InputDecoration(
+                        filled: true,
+                        fillColor: Colors.white10,
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(24), borderSide: BorderSide.none),
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
+                    icon: const Icon(Icons.send_rounded, color: _kAccent),
+                    onPressed: _send,
                   ),
                 ],
               ),
             ),
-            const SizedBox(height: 36),
-            // Garis progres tak-tentu (indeterminate) bergaya TV.
-            SizedBox(
-              width: 160,
-              height: 4,
-              child: AnimatedBuilder(
-                animation: _rippleCtrl,
-                builder: (context, _) {
-                  return ClipRRect(
-                    borderRadius: BorderRadius.circular(2),
-                    child: LinearProgressIndicator(
-                      value: null,
-                      backgroundColor: Colors.white10,
-                      valueColor: const AlwaysStoppedAnimation(Colors.amber),
-                    ),
-                  );
-                },
-              ),
-            ),
-            const SizedBox(height: 20),
-            // Titik-titik loading yang menyala bergiliran.
-            AnimatedBuilder(
-              animation: _dotsCtrl,
-              builder: (context, _) {
-                final active = (_dotsCtrl.value * 3).floor() % 3;
-                return Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: List.generate(3, (i) {
-                    final isActive = i == active;
-                    return AnimatedContainer(
-                      duration: const Duration(milliseconds: 200),
-                      margin: const EdgeInsets.symmetric(horizontal: 4),
-                      width: isActive ? 10 : 7,
-                      height: isActive ? 10 : 7,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: isActive ? Colors.amber : Colors.white24,
-                      ),
-                    );
-                  }),
-                );
-              },
-            ),
-            const SizedBox(height: 16),
-            const Text('Menyalakan...', style: TextStyle(color: Colors.white38, fontSize: 13)),
           ],
         ),
       ),
@@ -447,37 +533,36 @@ class _BootScreenState extends State<_BootScreen> with TickerProviderStateMixin 
   }
 }
 
-class EmoRoot extends StatefulWidget {
-  const EmoRoot({super.key});
+class _ReviewButton extends StatefulWidget {
+  final IconData icon;
+  final Color color;
+  final VoidCallback onTap;
+  const _ReviewButton({required this.icon, required this.color, required this.onTap});
 
   @override
-  State<EmoRoot> createState() => _EmoRootState();
+  State<_ReviewButton> createState() => _ReviewButtonState();
 }
 
-class _EmoRootState extends State<EmoRoot> {
-  late final EmoEngine _engine;
-  bool _ready = false;
-
-  @override
-  void initState() {
-    super.initState();
-    final repo = TursoConfig.isConfigured
-        ? TursoRepository(databaseUrl: TursoConfig.databaseUrl, authToken: TursoConfig.authToken)
-        : InMemoryRepository();
-    _engine = EmoEngine(repo);
-    _engine.init().then((_) async {
-      // Kelahiran otomatis, tanpa meminta nama — lihat catatan di
-      // EmoBirthScreen (dihapus) dan EmoEngine.autoBornIfNeeded().
-      await _engine.autoBornIfNeeded();
-      if (mounted) setState(() => _ready = true);
-    });
-  }
+class _ReviewButtonState extends State<_ReviewButton> with SingleTickerProviderStateMixin {
+  double _scale = 1.0;
 
   @override
   Widget build(BuildContext context) {
-    if (!_ready) {
-      return const _BootScreen();
-    }
-    return EmoHomeScreen(engine: _engine);
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _scale = 0.85),
+      onTapUp: (_) => setState(() => _scale = 1.0),
+      onTapCancel: () => setState(() => _scale = 1.0),
+      onTap: widget.onTap,
+      child: AnimatedScale(
+        scale: _scale,
+        duration: const Duration(milliseconds: 120),
+        child: Container(
+          width: 64,
+          height: 64,
+          decoration: BoxDecoration(color: Colors.white10, shape: BoxShape.circle),
+          child: Icon(widget.icon, color: widget.color, size: 30),
+        ),
+      ),
+    );
   }
 }
