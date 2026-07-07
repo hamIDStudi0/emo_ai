@@ -56,87 +56,116 @@ workflows:
 
       - name: 4. Suntik Pengaturan Rilis ke build.gradle Baru
         script: |
-          # Flutter versi baru membuat android/app/build.gradle.kts (Kotlin DSL),
-          # bukan lagi build.gradle (Groovy) — deteksi dulu file mana yang
-          # sebenarnya ada, baru suntik sintaks yang cocok.
-          #
-          # Tambahan: AGP 9.x defaultnya pakai "newDsl" yang mengubah tipe
-          # extension android{} (BaseAppModuleExtension -> ApplicationExtension)
-          # dan bikin konfigurasi signingConfigs/buildTypes gaya lama gagal.
-          # android.newDsl=false mengembalikan perilaku lama yang masih resmi
-          # didukung sampai AGP 10, jadi script di bawah tetap kompatibel.
+          # android.newDsl=false: AGP 9.x defaultnya pakai DSL baru yang
+          # mengubah tipe extension android{} (BaseAppModuleExtension ->
+          # ApplicationExtension) — ini kembalikan ke perilaku lama yang
+          # masih resmi didukung sampai AGP 10.
           echo "android.newDsl=false" >> android/gradle.properties
 
-          if [ -f android/app/build.gradle.kts ]; then
-            echo "Terdeteksi Kotlin DSL (build.gradle.kts)"
-            # Import HARUS ada di baris paling atas file Kotlin (bukan
-            # fully-qualified di tengah body) — makanya di-prepend, bukan
-            # di-append di bawah bersama konfigurasi android{}.
-            printf 'import java.util.Properties\nimport java.io.FileInputStream\n\n' \
-              | cat - android/app/build.gradle.kts > /tmp/bgk.tmp && mv /tmp/bgk.tmp android/app/build.gradle.kts
-            cat >> android/app/build.gradle.kts << 'EOF'
+          # PENTING: konfigurasi signing DISISIPKAN LANGSUNG ke dalam blok
+          # android{} yang SUDAH ADA dari template Flutter (bukan membuat
+          # blok android{} kedua terpisah di bawah). Percobaan sebelumnya
+          # pakai blok kedua gagal dengan "SigningConfig with name 'release'
+          # not found" karena urutan eksekusi dua invocation android{} yang
+          # terpisah tidak terjamin — signingConfigs.create() di blok kedua
+          # kadang belum tuntas saat buildTypes di blok lain mencarinya.
+          # Menyisipkan ke dalam satu blok yang sama menghilangkan masalah
+          # ini sepenuhnya karena urutan baris di dalam SATU blok itu pasti
+          # sekuensial.
+          python3 << 'PYEOF'
+          import re, pathlib
 
-          val keystoreProperties = Properties()
-          val keystorePropertiesFile = rootProject.file("key.properties")
-          if (keystorePropertiesFile.exists()) {
-              keystoreProperties.load(FileInputStream(keystorePropertiesFile))
-          }
+          kts = pathlib.Path("android/app/build.gradle.kts")
+          groovy = pathlib.Path("android/app/build.gradle")
 
-          android {
-              signingConfigs {
-<<<<<<< HEAD
-                  create("release") {
-=======
-                  getByName("release") {
->>>>>>> d740d67d5df7b0df599bc3915b0a7493bf5aa80a
-                      keyAlias = keystoreProperties.getProperty("keyAlias")
-                      keyPassword = keystoreProperties.getProperty("keyPassword")
-                      storeFile = file(keystoreProperties.getProperty("storeFile")!!)
-                      storePassword = keystoreProperties.getProperty("storePassword")
-                      storeType = "PKCS12"
-                  }
-              }
-              buildTypes {
-                  getByName("release") {
-                      signingConfig = signingConfigs.getByName("release")
-                      isMinifyEnabled = true
-                      isShrinkResources = true
-                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-                  }
-              }
-          }
-          EOF
-          else
-            echo "Terdeteksi Groovy DSL (build.gradle)"
-            cat >> android/app/build.gradle << 'EOF'
+          if kts.exists():
+              text = kts.read_text()
+              text = "import java.util.Properties\nimport java.io.FileInputStream\n\n" + text
 
-          def keystoreProperties = new Properties()
-          def keystorePropertiesFile = rootProject.file("key.properties")
-          if (keystorePropertiesFile.exists()) {
-              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
-          }
+              signing_block = (
+                  "\n    signingConfigs {\n"
+                  "        create(\"release\") {\n"
+                  "            val keystoreProperties = Properties()\n"
+                  "            val keystorePropertiesFile = rootProject.file(\"key.properties\")\n"
+                  "            if (keystorePropertiesFile.exists()) {\n"
+                  "                keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n"
+                  "            }\n"
+                  "            keyAlias = keystoreProperties.getProperty(\"keyAlias\")\n"
+                  "            keyPassword = keystoreProperties.getProperty(\"keyPassword\")\n"
+                  "            storeFile = file(keystoreProperties.getProperty(\"storeFile\")!!)\n"
+                  "            storePassword = keystoreProperties.getProperty(\"storePassword\")\n"
+                  "            storeType = \"PKCS12\"\n"
+                  "        }\n"
+                  "    }\n"
+              )
+              # Sisipkan TEPAT setelah baris pembuka 'android {' pertama, jadi
+              # dijamin ada sebelum buildTypes diproses di bawahnya.
+              text, n = re.subn(r'(android\s*\{)', r'\1' + signing_block, text, count=1)
+              if n == 0:
+                  raise SystemExit("Tidak menemukan blok 'android {' di build.gradle.kts")
 
-          android {
-              signingConfigs {
-                  release {
-                      keyAlias keystoreProperties["keyAlias"]
-                      keyPassword keystoreProperties["keyPassword"]
-                      storeFile file(keystoreProperties["storeFile"])
-                      storePassword keystoreProperties["storePassword"]
-                      storeType "PKCS12"
-                  }
-              }
-              buildTypes {
-                  release {
-                      signingConfig signingConfigs.release
-                      minifyEnabled true
-                      shrinkResources true
-                      proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
-                  }
-              }
-          }
-          EOF
-          fi
+              # Arahkan release build type ke signingConfig "release" yang
+              # baru dibuat (template Flutter defaultnya memakai "debug").
+              text, n2 = re.subn(
+                  r'signingConfig\s*=\s*signingConfigs\.getByName\("debug"\)',
+                  'signingConfig = signingConfigs.getByName("release")',
+                  text,
+              )
+              if n2 == 0:
+                  print("PERINGATAN: baris signingConfig debug default tidak ditemukan — cek manual build.gradle.kts")
+
+              if "isMinifyEnabled" not in text:
+                  text, _ = re.subn(
+                      r'(signingConfig = signingConfigs\.getByName\("release"\))',
+                      r'\1\n            isMinifyEnabled = true\n            isShrinkResources = true\n'
+                      r'            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")',
+                      text,
+                      count=1,
+                  )
+              kts.write_text(text)
+              print("Berhasil menyisipkan signing config ke build.gradle.kts")
+
+          elif groovy.exists():
+              text = groovy.read_text()
+              signing_block = (
+                  "\n    signingConfigs {\n"
+                  "        release {\n"
+                  "            def keystoreProperties = new Properties()\n"
+                  "            def keystorePropertiesFile = rootProject.file(\"key.properties\")\n"
+                  "            if (keystorePropertiesFile.exists()) {\n"
+                  "                keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n"
+                  "            }\n"
+                  "            keyAlias keystoreProperties[\"keyAlias\"]\n"
+                  "            keyPassword keystoreProperties[\"keyPassword\"]\n"
+                  "            storeFile file(keystoreProperties[\"storeFile\"])\n"
+                  "            storePassword keystoreProperties[\"storePassword\"]\n"
+                  "            storeType \"PKCS12\"\n"
+                  "        }\n"
+                  "    }\n"
+              )
+              text, n = re.subn(r'(android\s*\{)', r'\1' + signing_block, text, count=1)
+              if n == 0:
+                  raise SystemExit("Tidak menemukan blok 'android {' di build.gradle")
+              text, n2 = re.subn(
+                  r'signingConfig\s+signingConfigs\.debug',
+                  'signingConfig signingConfigs.release',
+                  text,
+              )
+              if n2 == 0:
+                  print("PERINGATAN: baris signingConfig debug default tidak ditemukan — cek manual build.gradle")
+              if "minifyEnabled" not in text:
+                  text, _ = re.subn(
+                      r'(signingConfig signingConfigs\.release)',
+                      r'\1\n            minifyEnabled true\n            shrinkResources true\n'
+                      r'            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"',
+                      text,
+                      count=1,
+                  )
+              groovy.write_text(text)
+              print("Berhasil menyisipkan signing config ke build.gradle")
+          else:
+              raise SystemExit("Tidak ada android/app/build.gradle(.kts) ditemukan")
+          PYEOF
 
       - name: 5. Unduh Pustaka Dependencies
         script: |
