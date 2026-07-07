@@ -78,9 +78,35 @@ workflows:
           kts = pathlib.Path("android/app/build.gradle.kts")
           groovy = pathlib.Path("android/app/build.gradle")
 
+<<<<<<< HEAD
           if kts.exists():
               text = kts.read_text()
               text = "import java.util.Properties\nimport java.io.FileInputStream\n\n" + text
+=======
+          android {
+              signingConfigs {
+                  getByName("release") {
+                      keyAlias = keystoreProperties.getProperty("keyAlias")
+                      keyPassword = keystoreProperties.getProperty("keyPassword")
+                      storeFile = file(keystoreProperties.getProperty("storeFile")!!)
+                      storePassword = keystoreProperties.getProperty("storePassword")
+                      storeType = "PKCS12"
+                  }
+              }
+              buildTypes {
+                  getByName("release") {
+                      signingConfig = signingConfigs.getByName("release")
+                      isMinifyEnabled = true
+                      isShrinkResources = true
+                      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                  }
+              }
+          }
+          EOF
+          else
+            echo "Terdeteksi Groovy DSL (build.gradle)"
+            cat >> android/app/build.gradle << 'EOF'
+>>>>>>> b69c8288c638ed1d52d4d3b0b398dac08bdb10d3
 
               signing_block = (
                   "\n    signingConfigs {\n"
