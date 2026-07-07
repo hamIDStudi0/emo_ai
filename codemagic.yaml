@@ -11,6 +11,7 @@ workflows:
       flutter: stable
       groups:
         - keystore_credentials
+        - emo_ai_credentials
       vars:
         PACKAGE_NAME: "com.example.emo_ai"
         CM_KEYSTORE_PATH: "/tmp/keystore.p12"
@@ -198,9 +199,16 @@ workflows:
 
       - name: 6. Merakit File APK Rilis dengan Proteksi
         script: |
+          # EMO_SERVER_URL, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN berasal dari
+          # group `emo_ai_credentials` (Environment variables di Codemagic,
+          # dicentang Secure) — tidak pernah ditulis langsung di source code
+          # maupun di file ini.
           flutter build apk --release \
             --obfuscate \
-            --split-debug-info=build/app/outputs/symbols
+            --split-debug-info=build/app/outputs/symbols \
+            --dart-define=EMO_SERVER_URL="$EMO_SERVER_URL" \
+            --dart-define=TURSO_DATABASE_URL="$TURSO_DATABASE_URL" \
+            --dart-define=TURSO_AUTH_TOKEN="$TURSO_AUTH_TOKEN"
 
       - name: 7. Verifikasi Signing
         script: |

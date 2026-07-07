@@ -1,247 +1,217 @@
-// FILE 2: emo_engine.dart — 100% OFFLINE learning core.
+// FILE 2: emo_engine.dart
 //
 // ============================================================================
-// APA YANG BENAR-BENAR DILAKUKAN DI FILE INI (baca ini dulu sebelum protes
-// "kok masih ada daftar kata" — TIDAK ADA daftar kata di file ini sama sekali)
+// ARSITEKTUR BARU (baca dulu sebelum protes "kok masih ada logika lama")
 // ============================================================================
+// 1. KONTEKS: dulu engine menebak makna kata mentah sendiri (bandit murni).
+//    Sekarang, sebelum menebak, teks pengguna dikirim ke IndoBERT (via
+//    Hugging Face Inference API — model publik
+//    StevenLimcorn/indonesian-roberta-base-emotion-classifier, 5 label:
+//    anger/fear/happy/love/sadness) untuk dideteksi EMOSINYA. IndoBERT yang
+//    menangani "paham konteks/sinonim" — bukan lagi statistik co-occurrence
+//    buatan sendiri. Ini kenapa masalah "kata mirip tidak dikenali" hilang:
+//    IndoBERT sudah dilatih di jutaan kalimat.
 //
-// 1. TIDAK ADA jaringan/HTTP/database eksternal apa pun. Semua data hidup di
-//    satu file `.emoai` (JSON) di penyimpanan lokal perangkat. Ini alasan
-//    teknis kenapa Google Play Protect biasanya lebih tenang: tidak ada
-//    permission INTERNET yang dipakai untuk mengirim data ke server pihak
-//    ketiga sama sekali — app ini secara harfiah tidak tahu cara connect ke
-//    internet.
+// 2. Q-TABLE sekarang HANYA sebesar 6 baris (5 label emosi + 'netral' untuk
+//    hasil yang confidence-nya rendah), bukan per-kata lagi. Setiap baris
+//    tetap belajar emoji mana yang paling disukai untuk emosi itu, dengan
+//    algoritma epsilon-greedy yang sama seperti sebelumnya (termasuk
+//    perbaikan bug "nempel di emoji yang di-dislike").
 //
-// 2. TIDAK ADA daftar stopword/kata-hubung, TIDAK ADA kamus sinonim/antonim
-//    yang ditulis manusia. Setiap kata (dan setiap bigram/trigram) mulai
-//    dengan bobot yang SAMA PERSIS — nol pengetahuan. Yang membuat satu kata
-//    terasa "lebih penting" daripada kata lain nantinya adalah murni angka
-//    yang lahir dari feedback like/dislike yang pernah ia terima untuk kata
-//    itu (lihat `_informativeness`). Kata yang jarang mendapat reaksi
-//    konsisten akan tetap punya bobot mendekati baseline — persis seperti
-//    kata hubung "dan/atau/ya" akan berperilaku, TAPI itu kesimpulan yang
-//    ia sampai sendiri dari data, bukan aturan yang saya tulis untuknya.
+// 3. SATU AI UNTUK SEMUA ORANG: skor Q-table ini disimpan di Turso (bukan
+//    per-perangkat lagi) — semua orang yang pakai app ini menulis & membaca
+//    baris yang SAMA. Tidak ada lagi "buat AI baru"/multi-profil.
 //
-// 3. "Memahami sinonim/kata mirip dengan sendirinya": diimplementasikan
-//    sebagai model *distributional* yang sangat klasik dalam NLP —
-//    "you shall know a word by the company it keeps". Setiap kali dua kata
-//    muncul berdekatan dalam satu kalimat, `cooccurrence` mencatatnya. Saat
-//    entitas ini bertemu kata yang BELUM PERNAH dinilai sama sekali, ia
-//    menengok kata-kata lain yang paling sering muncul berbarengan dengan
-//    kata baru itu di masa lalu, lalu "meminjam" kecenderungan emoji dari
-//    kata-kata tetangga itu sebagai firasat awal (`_borrowedGuess`). Itulah
-//    cara paling jujur untuk mendapatkan efek "seolah tahu kata mirip"
-//    tanpa pernah diberi tahu definisi kata apa pun.
-//
-// 4. Yang TIDAK dilakukan (supaya tidak menjanjikan sesuatu yang palsu):
-//    ini TIDAK menulis ulang kodenya sendiri, TIDAK punya language model,
-//    TIDAK benar-benar "mengerti" bahasa Indonesia. Ia cuma bandit/tabel
-//    Q-learning + statistik co-occurrence sederhana. Efeknya BISA terasa
-//    seperti belajar makna dari nol — tapi secara jujur, itu tetap statistik,
-//    bukan pemahaman.
+// 4. Konsekuensi jujur: ini butuh internet (2 panggilan API: Hugging Face
+//    untuk deteksi emosi, Turso untuk baca/tulis skor). Kemungkinan Play
+//    Protect akan menandai app lagi karena ini, seperti sebelum kita bikin
+//    versi offline.
 // ============================================================================
 
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
-import 'package:path_provider/path_provider.dart';
+import 'package:http/http.dart' as http;
 import 'emo_model.dart';
 import 'emo_emojis.dart';
 
+/// Label yang benar-benar dipakai. 'netral' bukan output IndoBERT — dipakai
+/// kalau confidence tertinggi dari model di bawah ambang batas, supaya
+/// tebakan yang ragu-ragu tidak dipaksa masuk ke salah satu dari 5 emosi.
+const List<String> kEmotionLabels = ['anger', 'fear', 'happy', 'love', 'sadness', 'netral'];
+const double _kConfidenceThreshold = 0.40;
+
+// ============================================================================
+// IndoBERT — sekarang lewat server self-hosted sendiri (bukan Hugging Face
+// Inference API lagi), supaya tidak kena rate limit HF. Server ini yang
+// menjalankan model, APK cuma manggil endpoint /classify.
+// ============================================================================
+class IndoBertClassifier {
+  final String serverUrl; // contoh: https://emo-ai-server.onrender.com
+  IndoBertClassifier(this.serverUrl);
+
+  Future<String> classify(String text) async {
+    try {
+      final resp = await http
+          .post(
+            Uri.parse('$serverUrl/classify'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'text': text}),
+          )
+          // Timeout dilonggarkan karena server bisa "cold start" ~30-60 detik
+          // kalau baru bangun dari sleep (walau ada keep-alive, sesekali
+          // masih bisa kejadian).
+          .timeout(const Duration(seconds: 60));
+
+      if (resp.statusCode != 200) return 'netral';
+      final decoded = jsonDecode(resp.body);
+      final label = (decoded['label'] as String).toLowerCase();
+      final score = (decoded['score'] as num).toDouble();
+
+      if (score < _kConfidenceThreshold) return 'netral';
+      return kEmotionLabels.contains(label) ? label : 'netral';
+    } catch (_) {
+      return 'netral';
+    }
+  }
+}
+
+// ============================================================================
+// Turso — satu database bersama untuk SEMUA pengguna (satu AI: emo_ai).
+// ============================================================================
+class TursoStore {
+  final String databaseUrl;
+  final String authToken;
+  TursoStore({required this.databaseUrl, required this.authToken});
+
+  Uri get _httpUrl {
+    final host = databaseUrl.replaceFirst('libsql://', '').replaceFirst('wss://', '');
+    return Uri.parse('https://$host/v2/pipeline');
+  }
+
+  Future<List<dynamic>> _pipeline(List<Map<String, dynamic>> statements) async {
+    final body = {
+      'requests': [
+        ...statements.map((s) => {'type': 'execute', 'stmt': s}),
+        {'type': 'close'},
+      ],
+    };
+    final resp = await http
+        .post(_httpUrl, headers: {
+          'Authorization': 'Bearer $authToken',
+          'Content-Type': 'application/json',
+        }, body: jsonEncode(body))
+        .timeout(const Duration(seconds: 12));
+    if (resp.statusCode != 200) {
+      throw Exception('Turso error ${resp.statusCode}: ${resp.body}');
+    }
+    return (jsonDecode(resp.body)['results'] as List);
+  }
+
+  Map<String, dynamic> _textArg(String v) => {'type': 'text', 'value': v};
+  Map<String, dynamic> _floatArg(double v) => {'type': 'float', 'value': v};
+  Map<String, dynamic> _intArg(int v) => {'type': 'integer', 'value': v.toString()};
+
+  Future<void> ensureSchema() async {
+    await _pipeline([
+      {
+        'sql': 'CREATE TABLE IF NOT EXISTS emo_global_scores ('
+            'label TEXT NOT NULL, '
+            'emoji TEXT NOT NULL, '
+            'score REAL NOT NULL DEFAULT 0, '
+            'count INTEGER NOT NULL DEFAULT 0, '
+            'PRIMARY KEY (label, emoji))',
+      },
+      // Log anonim — tidak ada kolom identitas/nama pengguna sama sekali.
+      {
+        'sql': 'CREATE TABLE IF NOT EXISTS emo_reviews ('
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+            'ts INTEGER NOT NULL, '
+            'label TEXT NOT NULL, '
+            'emoji TEXT NOT NULL, '
+            'liked INTEGER NOT NULL)',
+      },
+    ]);
+  }
+
+  /// Ambil seluruh skor yang sudah pernah dipelajari (dari SEMUA pengguna)
+  /// untuk dimuat ke memori lokal saat aplikasi dibuka.
+  Future<Map<String, EmoLabelEntry>> loadAll() async {
+    final result = await _pipeline([
+      {'sql': 'SELECT label, emoji, score, count FROM emo_global_scores'},
+    ]);
+    final rows = (result[0]['response']['result']['rows'] as List);
+    final map = <String, EmoLabelEntry>{};
+    for (final row in rows) {
+      final label = row[0]['value'] as String;
+      final emoji = row[1]['value'] as String;
+      final score = double.parse(row[2]['value'].toString());
+      final count = int.parse(row[3]['value'].toString());
+      final entry = map.putIfAbsent(label, () => EmoLabelEntry(label));
+      entry.scores[emoji] = score;
+      entry.freq += count;
+    }
+    return map;
+  }
+
+  Future<void> upsertScore(String label, String emoji, double score, int count) async {
+    await _pipeline([
+      {
+        'sql': 'INSERT INTO emo_global_scores (label, emoji, score, count) VALUES (?, ?, ?, ?) '
+            'ON CONFLICT(label, emoji) DO UPDATE SET score = excluded.score, count = excluded.count',
+        'args': [_textArg(label), _textArg(emoji), _floatArg(score), _intArg(count)],
+      },
+    ]);
+  }
+
+  Future<void> logReview({required String label, required String emoji, required bool liked}) async {
+    await _pipeline([
+      {
+        'sql': 'INSERT INTO emo_reviews (ts, label, emoji, liked) VALUES (?, ?, ?, ?)',
+        'args': [
+          _intArg(DateTime.now().millisecondsSinceEpoch),
+          _textArg(label),
+          _textArg(emoji),
+          _intArg(liked ? 1 : 0),
+        ],
+      },
+    ]);
+  }
+}
+
 class EmoChain {
-  final List<String> keys;
-  final List<String> emojis;
-  final bool isIdle;
-  EmoChain({required this.keys, required this.emojis, this.isIdle = false});
+  final String label;
+  final String emoji;
+  EmoChain({required this.label, required this.emoji});
 }
 
-/// Mengurus daftar profil (banyak "AI" dalam satu perangkat) di penyimpanan
-/// lokal — direktori `<app-documents>/profiles/<id>.emoai`. Setiap file
-/// adalah JSON valid dan sekaligus format export/import (`.emoai`).
-class ProfileStore {
-  static Future<Directory> _dir() async {
-    final base = await getApplicationDocumentsDirectory();
-    final dir = Directory('${base.path}/profiles');
-    if (!await dir.exists()) await dir.create(recursive: true);
-    return dir;
-  }
-
-  static Future<File> fileFor(String id) async {
-    final dir = await _dir();
-    return File('${dir.path}/$id.emoai');
-  }
-
-  /// Mengembalikan semua profil yang tersimpan di perangkat ini, diurutkan
-  /// dari yang terbaru dibuat.
-  static Future<List<EmoProfile>> listProfiles() async {
-    final dir = await _dir();
-    final files = dir.listSync().whereType<File>().where((f) => f.path.endsWith('.emoai'));
-    final profiles = <EmoProfile>[];
-    for (final f in files) {
-      try {
-        final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
-        profiles.add(EmoProfile.fromJson(j));
-      } catch (_) {
-        // File korup/bukan format emoai — lewati diam-diam.
-      }
-    }
-    profiles.sort((a, b) => b.createdAtMs.compareTo(a.createdAtMs));
-    return profiles;
-  }
-
-  static Future<void> save(EmoProfile p) async {
-    final f = await fileFor(p.id);
-    await f.writeAsString(jsonEncode(p.toJson()));
-  }
-
-  static Future<void> delete(String id) async {
-    final f = await fileFor(id);
-    if (await f.exists()) await f.delete();
-  }
-
-  static Future<EmoProfile> createNew(String avatar) async {
-    final p = EmoProfile.fresh(avatar);
-    await save(p);
-    return p;
-  }
-
-  /// Mengimpor bytes file `.emoai` yang dipilih pengguna. ID diregenerasi
-  /// supaya tidak pernah bentrok dengan profil yang sudah ada di perangkat
-  /// ini, sementara avatar + seluruh memori/cooccurrence tetap dipertahankan
-  /// apa adanya.
-  static Future<EmoProfile> importFromBytes(List<int> bytes) async {
-    final j = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
-    if (j['format'] != 'emoai.v1') {
-      throw const FormatException('Bukan file .emoai yang valid');
-    }
-    final imported = EmoProfile.fromJson(j);
-    final fresh = EmoProfile(
-      id: EmoProfile.fresh(imported.avatar).id,
-      avatar: imported.avatar,
-      interactionCount: imported.interactionCount,
-      memory: imported.memory,
-      cooccurrence: imported.cooccurrence,
-    );
-    await save(fresh);
-    return fresh;
-  }
-
-  /// Menyiapkan bytes siap-tulis untuk export (dipakai bareng file_picker's
-  /// saveFile di layer UI).
-  static Uint8List exportBytes(EmoProfile p) => Uint8List.fromList(utf8.encode(jsonEncode(p.toJson())));
-}
-
-/// Mesin belajar untuk SATU profil yang sedang aktif dibuka.
+/// Mesin utama — satu instance dipakai untuk SATU AI bersama (emo_ai).
 class EmoEngine {
-  final EmoProfile profile;
+  final IndoBertClassifier classifier;
+  final TursoStore store;
   final _rng = Random();
   static const double _learningRate = 0.35;
+
+  final Map<String, EmoLabelEntry> _memory = {};
   EmoChain? _pending;
 
-  EmoEngine(this.profile);
+  EmoEngine({required this.classifier, required this.store});
 
-  Future<void> persist() => ProfileStore.save(profile);
-
-  List<String> tokenize(String text) => text
-      .toLowerCase()
-      .split(RegExp(r'[^a-z0-9à-ÿ]+'))
-      .where((t) => t.isNotEmpty)
-      .toList();
-
-  /// Bobot "seberapa informatif" sebuah kunci (kata/frasa) — TANPA daftar
-  /// kata apa pun. Kunci yang belum pernah dinilai mendapat bobot dasar
-  /// (zero-knowledge). Kunci yang sudah pernah dinilai mendapat bobot
-  /// tambahan sebanding dengan seberapa KUAT/KONSISTEN reaksi yang pernah
-  /// diterimanya — kata yang reaksinya campur-aduk (mendekati netral)
-  /// otomatis tetap berbobot rendah, persis seperti efek yang biasanya
-  /// dicapai dictionary stopword, tapi di sini murni hasil pengalaman.
-  double _informativeness(String key) {
-    final entry = profile.memory[key];
-    if (entry == null || entry.scores.isEmpty) return 1.0;
-    final maxAbs = entry.scores.values.map((v) => v.abs()).reduce(max);
-    return 1.0 + maxAbs * 3.0;
-  }
-
-  List<MapEntry<String, int>> _buildWeightedKeys(List<String> tokens) {
-    final raw = <String>[];
-    for (var i = 0; i < tokens.length; i++) {
-      raw.add(tokens[i]);
-      if (i + 1 < tokens.length) raw.add('${tokens[i]}|${tokens[i + 1]}');
-      if (i + 2 < tokens.length) raw.add('${tokens[i]}|${tokens[i + 1]}|${tokens[i + 2]}');
-    }
-    // Bobot integer (dibulatkan) sebanding dengan informativeness yang
-    // seluruhnya berasal dari _informativeness (pengalaman), bukan dari
-    // jenis n-gram-nya — bigram/trigram tidak diistimewakan begitu saja.
-    return raw.map((k) => MapEntry(k, (10 * _informativeness(k)).round())).toList();
-  }
-
-  String _weightedPickKey(List<MapEntry<String, int>> weighted) {
-    final total = weighted.fold<int>(0, (sum, e) => sum + e.value);
-    if (total <= 0) return weighted[_rng.nextInt(weighted.length)].key;
-    var roll = _rng.nextInt(total);
-    for (final e in weighted) {
-      if (roll < e.value) return e.key;
-      roll -= e.value;
-    }
-    return weighted.last.key;
-  }
-
-  /// Mencatat co-occurrence murni dari kata-kata yang benar-benar muncul
-  /// berbarengan dalam satu kalimat — ini satu-satunya "pengetahuan bahasa"
-  /// yang pernah dipegang entitas ini, dan seluruhnya berasal dari apa yang
-  /// diketik pengguna sendiri.
-  void _recordCooccurrence(List<String> tokens) {
-    for (var i = 0; i < tokens.length; i++) {
-      for (var j = 0; j < tokens.length; j++) {
-        if (i == j) continue;
-        final a = tokens[i], b = tokens[j];
-        final m = profile.cooccurrence.putIfAbsent(a, () => {});
-        m[b] = (m[b] ?? 0) + 1;
-      }
+  Future<void> init() async {
+    await store.ensureSchema();
+    final loaded = await store.loadAll();
+    _memory.addAll(loaded);
+    for (final label in kEmotionLabels) {
+      _memory.putIfAbsent(label, () => EmoLabelEntry(label));
     }
   }
 
-  /// Firasat awal untuk kata yang BELUM PERNAH dinilai: tengok tetangga
-  /// co-occurrence yang paling sering muncul bersamanya, ambil skor emoji
-  /// yang sudah dipelajari untuk tetangga2 itu, gabungkan berbobot jumlah
-  /// kemunculan bersama. Efeknya: kata baru yang sering nongol di kalimat
-  /// yang sama dengan kata yang sudah kuat asosiasinya, "mewarisi" sedikit
-  /// kecenderungan itu — analog paling jujur dari "mengerti kata mirip".
-  MapEntry<String, double>? _borrowedGuess(String key) {
-    final neighbors = profile.cooccurrence[key];
-    if (neighbors == null || neighbors.isEmpty) return null;
-    final sorted = neighbors.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
-    final blended = <String, double>{};
-    var totalWeight = 0.0;
-    for (final n in sorted.take(5)) {
-      final neighborEntry = profile.memory[n.key];
-      if (neighborEntry == null || neighborEntry.scores.isEmpty) continue;
-      final w = n.value.toDouble();
-      neighborEntry.scores.forEach((emoji, score) {
-        blended[emoji] = (blended[emoji] ?? 0) + score * w;
-      });
-      totalWeight += w;
-    }
-    if (totalWeight == 0 || blended.isEmpty) return null;
-    blended.updateAll((k, v) => v / totalWeight);
-    final best = blended.entries.reduce((a, b) => a.value >= b.value ? a : b);
-    // Hanya jadi firasat kalau cukup meyakinkan (bukan noise kecil).
-    if (best.value.abs() < 0.15) return null;
-    return best;
-  }
-
-  /// Epsilon-greedy pick, dengan dua perbaikan penting:
-  /// (a) kalau skor terbaik yang diketahui untuk kunci ini sudah negatif
-  ///     (pernah di-dislike dan itu satu-satunya yang tercatat), JANGAN
-  ///     tetap dieksploitasi — paksa eksplorasi & hindari memilih ulang
-  ///     emoji yang sama persis.
-  /// (b) kalau kunci ini benar-benar baru (belum pernah dinilai), coba dulu
-  ///     firasat dari `_borrowedGuess` (distributional) sebelum jatuh ke
-  ///     eksplorasi acak murni.
-  String _pickEmoji(String key) {
-    final entry = profile.memory.putIfAbsent(key, () => EmoMemoryEntry(key));
-    final epsilon = (1.0 - entry.freq * 0.05).clamp(0.08, 1.0);
+  /// Sama seperti versi sebelumnya: kalau skor terbaik yang diketahui untuk
+  /// label ini sudah negatif (baru saja di-dislike dan itu satu-satunya
+  /// tercatat), JANGAN tetap dieksploitasi — paksa eksplorasi & hindari
+  /// memilih ulang emoji yang sama.
+  String _pickEmoji(String label) {
+    final entry = _memory.putIfAbsent(label, () => EmoLabelEntry(label));
+    final epsilon = (1.0 - entry.freq * 0.03).clamp(0.10, 1.0);
 
     MapEntry<String, double>? best;
     if (entry.scores.isNotEmpty) {
@@ -253,75 +223,38 @@ class EmoEngine {
     String emoji;
     if (shouldExplore) {
       final avoid = bestIsDisliked ? best!.key : null;
-      final guess = entry.scores.isEmpty ? _borrowedGuess(key) : null;
-      if (guess != null && _rng.nextDouble() < 0.5) {
-        emoji = guess.key;
-      } else {
-        do {
-          emoji = kEmojiPalette[_rng.nextInt(kEmojiPalette.length)];
-        } while (emoji == avoid && kEmojiPalette.length > 1);
-      }
+      do {
+        emoji = kEmojiPalette[_rng.nextInt(kEmojiPalette.length)];
+      } while (emoji == avoid && kEmojiPalette.length > 1);
     } else {
       emoji = best!.key;
     }
-    entry.freq++;
     return emoji;
   }
 
-  EmoChain reply(String text) {
-    final tokens = tokenize(text);
-    _recordCooccurrence(tokens);
-    var weighted = _buildWeightedKeys(tokens);
-    if (weighted.isEmpty) weighted = [const MapEntry('_neutral_', 1)];
-
-    final length = 1 + _rng.nextInt(3);
-    final emojis = <String>[];
-    final usedKeys = <String>[];
-    for (var i = 0; i < length; i++) {
-      final key = _weightedPickKey(weighted);
-      emojis.add(_pickEmoji(key));
-      usedKeys.add(key);
-    }
-    profile.interactionCount++;
-    final chain = EmoChain(keys: usedKeys, emojis: emojis);
+  /// SATU balasan = SATU emoji (bukan rangkaian lagi).
+  Future<EmoChain> reply(String text) async {
+    final label = await classifier.classify(text);
+    final emoji = _pickEmoji(label);
+    final chain = EmoChain(label: label, emoji: emoji);
     _pending = chain;
     return chain;
   }
 
-  /// Reaksi otonom/idle — dipakai layar UI untuk "gumaman" spontan berbasis
-  /// kunci yang sudah pernah ada di memori (tanpa input baru dari pengguna).
-  EmoChain autonomous() {
-    if (profile.memory.isEmpty) {
-      final emoji = kEmojiPalette[_rng.nextInt(kEmojiPalette.length)];
-      final chain = EmoChain(keys: const ['_idle_'], emojis: [emoji], isIdle: true);
-      _pending = chain;
-      return chain;
-    }
-    final keys = profile.memory.keys.toList();
-    final length = 1 + _rng.nextInt(2);
-    final emojis = <String>[];
-    final usedKeys = <String>[];
-    for (var i = 0; i < length; i++) {
-      final key = keys[_rng.nextInt(keys.length)];
-      emojis.add(_pickEmoji(key));
-      usedKeys.add(key);
-    }
-    final chain = EmoChain(keys: usedKeys, emojis: emojis, isIdle: true);
-    _pending = chain;
-    return chain;
-  }
-
-  void review(bool liked) {
+  Future<void> review(bool liked) async {
     final chain = _pending;
     if (chain == null) return;
     final reward = liked ? 1.0 : -1.0;
-    for (var i = 0; i < chain.keys.length; i++) {
-      final entry = profile.memory.putIfAbsent(chain.keys[i], () => EmoMemoryEntry(chain.keys[i]));
-      final emoji = chain.emojis[i];
-      final current = entry.scores[emoji] ?? 0.0;
-      entry.scores[emoji] = current + _learningRate * (reward - current);
-    }
+    final entry = _memory.putIfAbsent(chain.label, () => EmoLabelEntry(chain.label));
+    final current = entry.scores[chain.emoji] ?? 0.0;
+    final updated = current + _learningRate * (reward - current);
+    entry.scores[chain.emoji] = updated;
+    entry.freq++;
     _pending = null;
-    persist();
+
+    // Tulis ke Turso supaya SEMUA pengguna lain langsung ikut belajar dari
+    // reaksi ini juga (satu otak bersama).
+    await store.upsertScore(chain.label, chain.emoji, updated, entry.freq);
+    await store.logReview(label: chain.label, emoji: chain.emoji, liked: liked);
   }
 }
