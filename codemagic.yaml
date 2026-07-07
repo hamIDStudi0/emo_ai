@@ -84,11 +84,7 @@ workflows:
 
           android {
               signingConfigs {
-<<<<<<< HEAD
-                  create("release") {
-=======
                   getByName("release") {
->>>>>>> d740d67d5df7b0df599bc3915b0a7493bf5aa80a
                       keyAlias = keystoreProperties.getProperty("keyAlias")
                       keyPassword = keystoreProperties.getProperty("keyPassword")
                       storeFile = file(keystoreProperties.getProperty("storeFile")!!)
