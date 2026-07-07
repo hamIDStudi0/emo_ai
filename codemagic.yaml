@@ -187,6 +187,11 @@ workflows:
               raise SystemExit("Tidak ada android/app/build.gradle(.kts) ditemukan")
           PYEOF
 
+          # proguardFiles merujuk ke proguard-rules.pro yang belum tentu ada
+          # di project fresh hasil `flutter create` — buat kosong saja kalau
+          # belum ada supaya R8 tidak gagal mencari file itu.
+          touch android/app/proguard-rules.pro
+
       - name: 5. Unduh Pustaka Dependencies
         script: |
           flutter pub get
