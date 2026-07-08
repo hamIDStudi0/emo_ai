@@ -34,14 +34,20 @@ workflows:
           # 2. Hapus seluruh isi folder kerja saat ini tanpa sisa
           rm -rf * .??*
 
-          # 3. Buat proyek Flutter baru dari nol (Pondasi Gradle paling modern)
+          # 3. Buat proyek Flutter baru dari nol
           flutter create . --project-name=emo_ai --org=com.example --platforms=android
 
-          # 4. Kembalikan file kode inti Anda ke proyek baru
+          # 4. Kembalikan file kode inti Anda ke proyek baru dengan benar
           rm -rf lib pubspec.yaml assets
           cp -r /tmp/core_app/lib .
           cp /tmp/core_app/pubspec.yaml .
-          [ -d "/tmp/core_app/assets" ] && cp -r /tmp/core_app/assets . || echo "No assets to restore"
+          
+          # Trik Perbaikan: Salin isi di dalam foldernya, bukan foldernya langsung
+          if [ -d "/tmp/core_app/assets" ]; then
+            mkdir -p assets
+            cp -r /tmp/core_app/assets/* assets/
+            echo "Assets restored successfully"
+          fi
 
       - name: 2. Rekonstruksi File .p12 dari Teks Base64
         script: |
@@ -55,32 +61,31 @@ workflows:
           echo "storeFile=$CM_KEYSTORE_PATH" >> android/key.properties
           echo "storeType=PKCS12" >> android/key.properties
 
-      - name: 4. Suntik Permission, Nama, dan Ikon dari GitHub
+      - name: 4. Suntik Permission, Nama, dan Paksa Ikon PNG
         script: |
           # A. Suntik Permission INTERNET
           sed -i '' 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET"/>#' android/app/src/main/AndroidManifest.xml
 
-          # B. Suntik Nama Aplikasi Kustom (Ubah "Emo.AI Pro" sesuai kebutuhan)
+          # B. Suntik Nama Aplikasi Kustom
           sed -i '' 's/android:label="emo_ai"/android:label="3M041"/' android/app/src/main/AndroidManifest.xml
 
-          # C. Suntik Ikon PNG dari folder assets GitHub
+          # C. Eksekusi Penggantian Ikon secara Agresif
           if [ -f "assets/app_icon.png" ]; then
-            # Pastikan folder target di Android bentukan baru sudah ada
-            mkdir -p android/app/src/main/res/mipmap-hdpi
-            mkdir -p android/app/src/main/res/mipmap-mdpi
-            mkdir -p android/app/src/main/res/mipmap-xhdpi
-            mkdir -p android/app/src/main/res/mipmap-xxhdpi
-            mkdir -p android/app/src/main/res/mipmap-xxxhdpi
-
-            # Salin dan timpa ikon bawaan Flutter dengan ikon dari GitHub Anda
-            cp assets/app_icon.png android/app/src/main/res/mipmap-hdpi/ic_launcher.png
-            cp assets/app_icon.png android/app/src/main/res/mipmap-mdpi/ic_launcher.png
-            cp assets/app_icon.png android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
-            cp assets/app_icon.png android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
-            cp assets/app_icon.png android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
-            echo "Ikon PNG dari GitHub berhasil dipasang ke sistem Android!"
+            # Hapus folder adaptive icon bawaan Flutter yang sering mengunci ikon robot hijau
+            rm -rf android/app/src/main/res/mipmap-anydpi-v26
+            
+            # Loop untuk memasukkan ikon kustom Anda ke semua resolusi
+            for density in hdpi mdpi xhdpi xxhdpi xxxhdpi; do
+              mkdir -p android/app/src/main/res/mipmap-$density
+              
+              # Timpa ikon standar DAN ikon bulat (round) dengan PNG Anda
+              cp assets/app_icon.png android/app/src/main/res/mipmap-$density/ic_launcher.png
+              cp assets/app_icon.png android/app/src/main/res/mipmap-$density/ic_launcher_round.png
+            done
+            echo "PROSES BERHASIL: Ikon PNG dipaksa masuk ke semua sistem!"
           else
-            echo "Peringatan: assets/app_icon.png tidak ditemukan di GitHub, menggunakan ikon default."
+            echo "ERROR KRITIS: File assets/app_icon.png tetap tidak ditemukan di folder kerja!"
+            exit 1
           fi
       - name: 5. Suntik Pengaturan Rilis ke build.gradle Baru
         script: |
