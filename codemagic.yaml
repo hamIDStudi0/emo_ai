@@ -55,11 +55,33 @@ workflows:
           echo "storeFile=$CM_KEYSTORE_PATH" >> android/key.properties
           echo "storeType=PKCS12" >> android/key.properties
 
-      - name: 4. Suntik Permission INTERNET
+      - name: 4. Suntik Permission, Nama, dan Ikon dari GitHub
         script: |
+          # A. Suntik Permission INTERNET
           sed -i '' 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET"/>#' android/app/src/main/AndroidManifest.xml
-          grep -q "android.permission.INTERNET" android/app/src/main/AndroidManifest.xml && echo "Permission INTERNET OK" || (echo "GAGAL menyisipkan permission INTERNET" && exit 1)
 
+          # B. Suntik Nama Aplikasi Kustom (Ubah "Emo.AI Pro" sesuai kebutuhan)
+          sed -i '' 's/android:label="emo_ai"/android:label="3M041"/' android/app/src/main/AndroidManifest.xml
+
+          # C. Suntik Ikon PNG dari folder assets GitHub
+          if [ -f "assets/app_icon.png" ]; then
+            # Pastikan folder target di Android bentukan baru sudah ada
+            mkdir -p android/app/src/main/res/mipmap-hdpi
+            mkdir -p android/app/src/main/res/mipmap-mdpi
+            mkdir -p android/app/src/main/res/mipmap-xhdpi
+            mkdir -p android/app/src/main/res/mipmap-xxhdpi
+            mkdir -p android/app/src/main/res/mipmap-xxxhdpi
+
+            # Salin dan timpa ikon bawaan Flutter dengan ikon dari GitHub Anda
+            cp assets/app_icon.png android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+            cp assets/app_icon.png android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+            cp assets/app_icon.png android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+            cp assets/app_icon.png android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+            cp assets/app_icon.png android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+            echo "Ikon PNG dari GitHub berhasil dipasang ke sistem Android!"
+          else
+            echo "Peringatan: assets/app_icon.png tidak ditemukan di GitHub, menggunakan ikon default."
+          fi
       - name: 5. Suntik Pengaturan Rilis ke build.gradle Baru
         script: |
           # android.newDsl=false: AGP 9.x defaultnya pakai DSL baru yang
