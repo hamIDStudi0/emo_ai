@@ -61,32 +61,17 @@ workflows:
           echo "storeFile=$CM_KEYSTORE_PATH" >> android/key.properties
           echo "storeType=PKCS12" >> android/key.properties
 
-      - name: 4. Suntik Permission, Nama, dan Paksa Ikon PNG
+      - name: 4. Suntik Nama Aplikasi dan Generate Ikon Pribadi
         script: |
           # A. Suntik Permission INTERNET
           sed -i '' 's#<manifest xmlns:android="http://schemas.android.com/apk/res/android">#<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n    <uses-permission android:name="android.permission.INTERNET"/>#' android/app/src/main/AndroidManifest.xml
 
           # B. Suntik Nama Aplikasi Kustom
-          sed -i '' 's/android:label="emo_ai"/android:label="3M041"/' android/app/src/main/AndroidManifest.xml
+          sed -i '' 's/android:label="emo_ai"/android:label="Emo.AI Pro"/' android/app/src/main/AndroidManifest.xml
 
-          # C. Eksekusi Penggantian Ikon secara Agresif
-          if [ -f "assets/app_icon.png" ]; then
-            # Hapus folder adaptive icon bawaan Flutter yang sering mengunci ikon robot hijau
-            rm -rf android/app/src/main/res/mipmap-anydpi-v26
-            
-            # Loop untuk memasukkan ikon kustom Anda ke semua resolusi
-            for density in hdpi mdpi xhdpi xxhdpi xxxhdpi; do
-              mkdir -p android/app/src/main/res/mipmap-$density
-              
-              # Timpa ikon standar DAN ikon bulat (round) dengan PNG Anda
-              cp assets/app_icon.png android/app/src/main/res/mipmap-$density/ic_launcher.png
-              cp assets/app_icon.png android/app/src/main/res/mipmap-$density/ic_launcher_round.png
-            done
-            echo "PROSES BERHASIL: Ikon PNG dipaksa masuk ke semua sistem!"
-          else
-            echo "ERROR KRITIS: File assets/app_icon.png tetap tidak ditemukan di folder kerja!"
-            exit 1
-          fi
+          # C. Jalankan generator ikon (Otomatis membaca pubspec.yaml yang baru)
+          flutter pub get
+          flutter pub run flutter_launcher_icons
       - name: 5. Suntik Pengaturan Rilis ke build.gradle Baru
         script: |
           # android.newDsl=false: AGP 9.x defaultnya pakai DSL baru yang

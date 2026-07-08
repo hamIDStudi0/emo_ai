@@ -1,5 +1,5 @@
 name: emo_ai
-description: "emo.ai — satu AI bersama, dibantu IndoBERT (Flutter)."
+description: "emo.ai --version 0.0.6"
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -15,8 +15,15 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^3.0.0
+  flutter_launcher_icons: ^0.13.1 # <--- 1. Tambahkan ini di dev_dependencies
 
 flutter:
   uses-material-design: true
   assets:
     - assets/
+
+# <--- 2. Tambahkan blok ini di paling bawah (SEJAJAR dengan kata flutter: di atas)
+flutter_launcher_icons:
+  android: "ic_launcher"
+  ios: true
+  image_path: "assets/app_icon.png"
