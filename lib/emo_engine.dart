@@ -1,31 +1,27 @@
 // FILE 2: emo_engine.dart
 //
 // ============================================================================
-// ARSITEKTUR BARU (baca dulu sebelum protes "kok masih ada logika lama")
+// VERSI "KOMBINASI PERASAAN" — baca ini dulu.
 // ============================================================================
-// 1. KONTEKS: dulu engine menebak makna kata mentah sendiri (bandit murni).
-//    Sekarang, sebelum menebak, teks pengguna dikirim ke IndoBERT (via
-//    Hugging Face Inference API — model publik
-//    StevenLimcorn/indonesian-roberta-base-emotion-classifier, 5 label:
-//    anger/fear/happy/love/sadness) untuk dideteksi EMOSINYA. IndoBERT yang
-//    menangani "paham konteks/sinonim" — bukan lagi statistik co-occurrence
-//    buatan sendiri. Ini kenapa masalah "kata mirip tidak dikenali" hilang:
-//    IndoBERT sudah dilatih di jutaan kalimat.
-//
-// 2. Q-TABLE sekarang HANYA sebesar 6 baris (5 label emosi + 'netral' untuk
-//    hasil yang confidence-nya rendah), bukan per-kata lagi. Setiap baris
-//    tetap belajar emoji mana yang paling disukai untuk emosi itu, dengan
-//    algoritma epsilon-greedy yang sama seperti sebelumnya (termasuk
-//    perbaikan bug "nempel di emoji yang di-dislike").
-//
-// 3. SATU AI UNTUK SEMUA ORANG: skor Q-table ini disimpan di Turso (bukan
-//    per-perangkat lagi) — semua orang yang pakai app ini menulis & membaca
-//    baris yang SAMA. Tidak ada lagi "buat AI baru"/multi-profil.
-//
-// 4. Konsekuensi jujur: ini butuh internet (2 panggilan API: Hugging Face
-//    untuk deteksi emosi, Turso untuk baca/tulis skor). Kemungkinan Play
-//    Protect akan menandai app lagi karena ini, seperti sebelum kita bikin
-//    versi offline.
+// IndoBERT sekarang dibaca SEMUA skornya (bukan cuma yang tertinggi).
+// - Label #1 (tertinggi) & #2 (kedua tertinggi) dibandingkan.
+// - closeness = skor#2 / skor#1 (0..1). Makin dekat ke 1, makin ambigu
+//   perasaannya (mis. happy 70% vs sadness 50% -> closeness 0.71).
+// - closeness dipakai LANGSUNG sebagai peluang memakai kunci GABUNGAN
+//   ("happy+sadness") alih-alih kunci TUNGGAL ("happy"). Ini yang bikin
+//   persentase itu akhirnya benar-benar berpengaruh ke perilaku, bukan
+//   cuma dibuang setelah menentukan siapa juara.
+// - Kunci gabungan punya keranjang emoji GABUNGAN (union 2 keranjang) dan
+//   Q-table SENDIRI, terpisah dari kunci tunggal — jadi ia bisa belajar
+//   "karakter emoji" khusus untuk situasi campur-aduk itu (mis. 🥲 buat
+//   "senang campur sedih"), bukan sekadar niru salah satu perasaan mentah.
+// - Saat DISLIKE pada kunci tunggal, kalau ada label kedua yang cukup
+//   signifikan, engine JUGA memberi nudge kecil ke kunci gabungan untuk
+//   emoji yang sama — supaya data "kemungkinan ini sebenarnya campuran"
+//   ikut terekam, walau saat itu yang dipakai cuma kunci tunggal.
+// - Ini SEMUA tetap statistik/bandit, bukan "AI benar-benar merasa" —
+//   efek "punya karakter sendiri" itu murni pola yang menetap dari akumulasi
+//   feedback, bukan kesadaran. Saya jujur soal ini supaya ekspektasinya pas.
 // ============================================================================
 
 import 'dart:convert';
@@ -34,120 +30,78 @@ import 'package:http/http.dart' as http;
 import 'emo_model.dart';
 import 'emo_emojis.dart';
 
-/// Label yang benar-benar dipakai. 'netral' bukan output IndoBERT — dipakai
-/// kalau confidence tertinggi dari model di bawah ambang batas, supaya
-/// tebakan yang ragu-ragu tidak dipaksa masuk ke salah satu dari 5 emosi.
-const List<String> kEmotionLabels = ['anger', 'fear', 'happy', 'love', 'sadness', 'netral'];
-const double _kConfidenceThreshold = 0.40;
+const List<String> kEmotionLabels = ['anger', 'fear', 'happy', 'love', 'sadness'];
+const double _kSecondaryFloor = 0.15; // di bawah ini, label ke-2 dianggap noise.
 
-// ============================================================================
-// IndoBERT via Hugging Face Inference API — HANYA deteksi emosi, tidak ada
-// model yang di-bundle ke APK sama sekali (ukuran app tetap kecil).
-// ============================================================================
 class IndoBertClassifier {
   static const _modelUrl =
       'https://api-inference.huggingface.co/models/StevenLimcorn/indonesian-roberta-base-emotion-classifier';
   final String hfToken;
   IndoBertClassifier(this.hfToken);
 
-  /// Mengembalikan salah satu dari kEmotionLabels. Kalau API gagal/timeout/
-  /// model masih "cold start", jatuh ke 'netral' — bukan error yang
-  /// menghentikan alur chat.
-  Future<String> classify(String text) async {
+  /// Mengembalikan SEMUA skor label (label -> 0..1), bukan cuma juaranya.
+  /// Gagal/timeout -> map kosong (engine akan jatuh ke 'netral').
+  Future<Map<String, double>> classify(String text) async {
     try {
       final resp = await http
-          .post(
-            Uri.parse(_modelUrl),
-            headers: {
-              'Authorization': 'Bearer $hfToken',
-              'Content-Type': 'application/json',
-            },
-            body: jsonEncode({'inputs': text}),
-          )
-          .timeout(const Duration(seconds: 12));
-
-      if (resp.statusCode != 200) return 'netral';
+          .post(Uri.parse(_modelUrl),
+              headers: {'Authorization': 'Bearer $hfToken', 'Content-Type': 'application/json'},
+              body: jsonEncode({'inputs': text}))
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) return {};
       final decoded = jsonDecode(resp.body);
-
-      // Format HF kadang list-of-list, kadang list biasa — tangani dua-duanya.
       final List<dynamic> preds = (decoded is List && decoded.isNotEmpty && decoded.first is List)
           ? decoded.first as List<dynamic>
           : (decoded is List ? decoded : []);
-      if (preds.isEmpty) return 'netral';
-
-      preds.sort((a, b) => (b['score'] as num).compareTo(a['score'] as num));
-      final top = preds.first;
-      final label = (top['label'] as String).toLowerCase();
-      final score = (top['score'] as num).toDouble();
-
-      if (score < _kConfidenceThreshold) return 'netral';
-      return kEmotionLabels.contains(label) ? label : 'netral';
+      final out = <String, double>{};
+      for (final p in preds) {
+        final label = (p['label'] as String).toLowerCase();
+        if (kEmotionLabels.contains(label)) out[label] = (p['score'] as num).toDouble();
+      }
+      return out;
     } catch (_) {
-      return 'netral';
+      return {};
     }
   }
 }
 
-// ============================================================================
-// Turso — satu database bersama untuk SEMUA pengguna (satu AI: emo_ai).
-// ============================================================================
 class TursoStore {
   final String databaseUrl;
   final String authToken;
   TursoStore({required this.databaseUrl, required this.authToken});
 
-  Uri get _httpUrl {
-    final host = databaseUrl.replaceFirst('libsql://', '').replaceFirst('wss://', '');
-    return Uri.parse('https://$host/v2/pipeline');
-  }
+  Uri get _httpUrl => Uri.parse('https://${databaseUrl.replaceFirst('libsql://', '')}/v2/pipeline');
 
   Future<List<dynamic>> _pipeline(List<Map<String, dynamic>> statements) async {
     final body = {
-      'requests': [
-        ...statements.map((s) => {'type': 'execute', 'stmt': s}),
-        {'type': 'close'},
-      ],
+      'requests': [...statements.map((s) => {'type': 'execute', 'stmt': s}), {'type': 'close'}]
     };
     final resp = await http
-        .post(_httpUrl, headers: {
-          'Authorization': 'Bearer $authToken',
-          'Content-Type': 'application/json',
-        }, body: jsonEncode(body))
+        .post(_httpUrl, headers: {'Authorization': 'Bearer $authToken', 'Content-Type': 'application/json'}, body: jsonEncode(body))
         .timeout(const Duration(seconds: 12));
-    if (resp.statusCode != 200) {
-      throw Exception('Turso error ${resp.statusCode}: ${resp.body}');
-    }
+    if (resp.statusCode != 200) throw Exception('Turso error ${resp.statusCode}: ${resp.body}');
     return (jsonDecode(resp.body)['results'] as List);
   }
 
-  Map<String, dynamic> _textArg(String v) => {'type': 'text', 'value': v};
-  Map<String, dynamic> _floatArg(double v) => {'type': 'float', 'value': v};
-  Map<String, dynamic> _intArg(int v) => {'type': 'integer', 'value': v.toString()};
+  Map<String, dynamic> _t(String v) => {'type': 'text', 'value': v};
+  Map<String, dynamic> _f(double v) => {'type': 'float', 'value': v};
+  Map<String, dynamic> _i(int v) => {'type': 'integer', 'value': v.toString()};
 
   Future<void> ensureSchema() async {
     await _pipeline([
       {
         'sql': 'CREATE TABLE IF NOT EXISTS emo_global_scores ('
-            'label TEXT NOT NULL, '
-            'emoji TEXT NOT NULL, '
-            'score REAL NOT NULL DEFAULT 0, '
-            'count INTEGER NOT NULL DEFAULT 0, '
-            'PRIMARY KEY (label, emoji))',
+            'label TEXT NOT NULL, emoji TEXT NOT NULL, score REAL NOT NULL DEFAULT 0, '
+            'count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (label, emoji))'
       },
-      // Log anonim — tidak ada kolom identitas/nama pengguna sama sekali.
       {
         'sql': 'CREATE TABLE IF NOT EXISTS emo_reviews ('
-            'id INTEGER PRIMARY KEY AUTOINCREMENT, '
-            'ts INTEGER NOT NULL, '
-            'label TEXT NOT NULL, '
-            'emoji TEXT NOT NULL, '
-            'liked INTEGER NOT NULL)',
+            'id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, label TEXT NOT NULL, '
+            'emoji TEXT NOT NULL, liked INTEGER NOT NULL)'
       },
     ]);
   }
 
-  /// Ambil seluruh skor yang sudah pernah dipelajari (dari SEMUA pengguna)
-  /// untuk dimuat ke memori lokal saat aplikasi dibuka.
   Future<Map<String, EmoLabelEntry>> loadAll() async {
     final result = await _pipeline([
       {'sql': 'SELECT label, emoji, score, count FROM emo_global_scores'},
@@ -156,12 +110,9 @@ class TursoStore {
     final map = <String, EmoLabelEntry>{};
     for (final row in rows) {
       final label = row[0]['value'] as String;
-      final emoji = row[1]['value'] as String;
-      final score = double.parse(row[2]['value'].toString());
-      final count = int.parse(row[3]['value'].toString());
       final entry = map.putIfAbsent(label, () => EmoLabelEntry(label));
-      entry.scores[emoji] = score;
-      entry.freq += count;
+      entry.scores[row[1]['value'] as String] = double.parse(row[2]['value'].toString());
+      entry.freq += int.parse(row[3]['value'].toString());
     }
     return map;
   }
@@ -171,7 +122,7 @@ class TursoStore {
       {
         'sql': 'INSERT INTO emo_global_scores (label, emoji, score, count) VALUES (?, ?, ?, ?) '
             'ON CONFLICT(label, emoji) DO UPDATE SET score = excluded.score, count = excluded.count',
-        'args': [_textArg(label), _textArg(emoji), _floatArg(score), _intArg(count)],
+        'args': [_t(label), _t(emoji), _f(score), _i(count)],
       },
     ]);
   }
@@ -180,29 +131,25 @@ class TursoStore {
     await _pipeline([
       {
         'sql': 'INSERT INTO emo_reviews (ts, label, emoji, liked) VALUES (?, ?, ?, ?)',
-        'args': [
-          _intArg(DateTime.now().millisecondsSinceEpoch),
-          _textArg(label),
-          _textArg(emoji),
-          _intArg(liked ? 1 : 0),
-        ],
+        'args': [_i(DateTime.now().millisecondsSinceEpoch), _t(label), _t(emoji), _i(liked ? 1 : 0)],
       },
     ]);
   }
 }
 
 class EmoChain {
-  final String label;
+  final String label; // "happy" atau kombinasi "happy+sadness"
   final String emoji;
-  EmoChain({required this.label, required this.emoji});
+  final String? secondaryLabel; // label ke-2 signifikan, kalau ada (untuk cross-nudge)
+  EmoChain({required this.label, required this.emoji, this.secondaryLabel});
 }
 
-/// Mesin utama — satu instance dipakai untuk SATU AI bersama (emo_ai).
 class EmoEngine {
   final IndoBertClassifier classifier;
   final TursoStore store;
   final _rng = Random();
   static const double _learningRate = 0.35;
+  static const double _crossLearningRate = 0.15; // nudge lebih lemah utk kunci gabungan
 
   final Map<String, EmoLabelEntry> _memory = {};
   EmoChain? _pending;
@@ -211,19 +158,27 @@ class EmoEngine {
 
   Future<void> init() async {
     await store.ensureSchema();
-    final loaded = await store.loadAll();
-    _memory.addAll(loaded);
-    for (final label in kEmotionLabels) {
-      _memory.putIfAbsent(label, () => EmoLabelEntry(label));
-    }
+    _memory.addAll(await store.loadAll());
   }
 
-  /// Sama seperti versi sebelumnya: kalau skor terbaik yang diketahui untuk
-  /// label ini sudah negatif (baru saja di-dislike dan itu satu-satunya
-  /// tercatat), JANGAN tetap dieksploitasi — paksa eksplorasi & hindari
-  /// memilih ulang emoji yang sama.
-  String _pickEmoji(String label) {
-    final entry = _memory.putIfAbsent(label, () => EmoLabelEntry(label));
+  /// Nama kunci gabungan selalu diurutkan alfabetis supaya "happy+sadness"
+  /// dan "sadness+happy" adalah kunci yang SAMA.
+  String _comboKey(String a, String b) {
+    final list = [a, b]..sort();
+    return list.join('+');
+  }
+
+  List<String> _basketFor(String key) {
+    if (key.contains('+')) {
+      final parts = key.split('+');
+      return [...?kBaskets[parts[0]], ...?kBaskets[parts[1]]];
+    }
+    return kBaskets[key] ?? kNetral;
+  }
+
+  String _pickEmoji(String key) {
+    final pool = _basketFor(key);
+    final entry = _memory.putIfAbsent(key, () => EmoLabelEntry(key));
     final epsilon = (1.0 - entry.freq * 0.03).clamp(0.10, 1.0);
 
     MapEntry<String, double>? best;
@@ -237,37 +192,69 @@ class EmoEngine {
     if (shouldExplore) {
       final avoid = bestIsDisliked ? best!.key : null;
       do {
-        emoji = kEmojiPalette[_rng.nextInt(kEmojiPalette.length)];
-      } while (emoji == avoid && kEmojiPalette.length > 1);
+        emoji = pool[_rng.nextInt(pool.length)];
+      } while (emoji == avoid && pool.length > 1);
     } else {
       emoji = best!.key;
     }
     return emoji;
   }
 
-  /// SATU balasan = SATU emoji (bukan rangkaian lagi).
   Future<EmoChain> reply(String text) async {
-    final label = await classifier.classify(text);
-    final emoji = _pickEmoji(label);
-    final chain = EmoChain(label: label, emoji: emoji);
+    final scores = await classifier.classify(text);
+    if (scores.isEmpty) {
+      final emoji = _pickEmoji('netral');
+      final chain = EmoChain(label: 'netral', emoji: emoji);
+      _pending = chain;
+      return chain;
+    }
+
+    final sorted = scores.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+    final primary = sorted.first;
+    final secondary = sorted.length > 1 ? sorted[1] : null;
+
+    String key = primary.key;
+    String? secondaryLabel;
+    if (secondary != null && secondary.value >= _kSecondaryFloor) {
+      secondaryLabel = secondary.key;
+      // closeness = skor#2 / skor#1, LANGSUNG jadi peluang pakai kunci gabungan.
+      final closeness = (secondary.value / primary.value).clamp(0.0, 1.0);
+      if (_rng.nextDouble() < closeness) {
+        key = _comboKey(primary.key, secondary.key);
+      }
+    }
+
+    final emoji = _pickEmoji(key);
+    final chain = EmoChain(label: key, emoji: emoji, secondaryLabel: secondaryLabel);
     _pending = chain;
     return chain;
+  }
+
+  Future<void> _applyUpdate(String key, String emoji, double reward, double rate) async {
+    final entry = _memory.putIfAbsent(key, () => EmoLabelEntry(key));
+    final current = entry.scores[emoji] ?? 0.0;
+    final updated = current + rate * (reward - current);
+    entry.scores[emoji] = updated;
+    entry.freq++;
+    await store.upsertScore(key, emoji, updated, entry.freq);
   }
 
   Future<void> review(bool liked) async {
     final chain = _pending;
     if (chain == null) return;
     final reward = liked ? 1.0 : -1.0;
-    final entry = _memory.putIfAbsent(chain.label, () => EmoLabelEntry(chain.label));
-    final current = entry.scores[chain.emoji] ?? 0.0;
-    final updated = current + _learningRate * (reward - current);
-    entry.scores[chain.emoji] = updated;
-    entry.freq++;
-    _pending = null;
 
-    // Tulis ke Turso supaya SEMUA pengguna lain langsung ikut belajar dari
-    // reaksi ini juga (satu otak bersama).
-    await store.upsertScore(chain.label, chain.emoji, updated, entry.freq);
+    await _applyUpdate(chain.label, chain.emoji, reward, _learningRate);
+
+    // Cross-nudge: kalau yang dipakai kunci TUNGGAL tapi ada label kedua
+    // signifikan, ikut catat sinyal ini (lebih lemah) ke kunci gabungan —
+    // supaya data "mungkin ini sebenarnya campuran" tetap terekam.
+    if (!chain.label.contains('+') && chain.secondaryLabel != null) {
+      final comboKey = _comboKey(chain.label, chain.secondaryLabel!);
+      await _applyUpdate(comboKey, chain.emoji, reward, _crossLearningRate);
+    }
+
     await store.logReview(label: chain.label, emoji: chain.emoji, liked: liked);
+    _pending = null;
   }
 }
