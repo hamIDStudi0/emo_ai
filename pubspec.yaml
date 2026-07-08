@@ -25,5 +25,5 @@ flutter:
 # <--- 2. Tambahkan blok ini di paling bawah (SEJAJAR dengan kata flutter: di atas)
 flutter_launcher_icons:
   android: "ic_launcher"
-  ios: true
+  ios: false
   image_path: "assets/app_icon.png"
